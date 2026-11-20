@@ -48,7 +48,10 @@
 <tr>
   <td>#{{ g.id }}</td>
   <td>
-    <div>{{ g.sample_path | basename }}</div>
+    <div>{{ g.sample_path | basename }}
+      {% if g.sample_missing %}<span class="pill needs_recheck">抽查：文件已不存在</span>{% endif %}
+      {% if g.keep_missing %}<span class="pill needs_recheck">保留份已不存在</span>{% endif %}
+    </div>
     <div class="muted small mono">{{ g.sample_path }}</div>
   </td>
   <td>{{ g.member_count }} 份</td>

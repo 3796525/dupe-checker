@@ -18,6 +18,17 @@
 {% endif %}
 
 <div class="card">
+  <h2>删除前重新校验</h2>
+  <p class="muted small">
+    如果你生成清单后隔了一段时间才动手删除，请先点一次这里：工具会把清单里的每个文件重新读取一遍，
+    核对大小、修改时间和 SHA-256，并确认「保留的文件」还在。发现变化时，清单会变成「需复核」并停止导出。
+    <strong>只读取文件，不会修改或删除任何东西。</strong>
+  </p>
+  <button onclick="recheckPlan()" id="recheck-btn">重新校验所有文件</button>
+  <p id="recheck-msg" class="small"></p>
+</div>
+
+<div class="card">
   <h2>导出与使用</h2>
   <p class="muted small">
     CSV 适合在表格软件里逐行核对；HTML 适合在浏览器里看；JSON 便于留档或二次处理。
@@ -66,4 +77,27 @@
 {% else %}
 <div class="card empty"><p>这份清单没有条目。</p></div>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+async function recheckPlan() {
+  const btn = document.getElementById('recheck-btn');
+  const msg = document.getElementById('recheck-msg');
+  btn.disabled = true;
+  btn.textContent = '校验中…（条目多时需要几分钟）';
+  msg.textContent = '正在逐个核对文件，请稍候…';
+  const r = await api('POST', '/api/v1/delete-plans/{{ plan.id }}/recheck', {});
+  if (!r.ok) {
+    msg.textContent = (r.data.error || {}).message || '校验失败';
+    btn.disabled = false;
+    btn.textContent = '重新校验所有文件';
+    return;
+  }
+  const c = r.data.counts || {};
+  const text = '校验完成：未变化 ' + (c.consistent || 0) + ' 项，已修改 ' + (c.changed || 0) +
+    ' 项，已不存在 ' + (c.missing || 0) + ' 项，无法读取 ' + (c.error || 0) + ' 项。';
+  msg.textContent = text + (r.data.status === 'final' ? ' 清单仍可导出。' : ' 清单已标记为需复核，暂停导出。');
+  setTimeout(() => location.reload(), 1500);
+}
+</script>
 {% endblock %}

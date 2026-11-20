@@ -5,6 +5,14 @@
 <p class="small"><a href="/review?kind={{ group.kind }}&status=pending">← 返回审核列表</a></p>
 <h1>审核分组 #{{ group.id }} <span class="pill {{ group.status }}">{{ status_text.get(group.status, group.status) }}</span></h1>
 
+{% if missing_count or changed_count %}
+<div class="notice warn">
+  <strong>索引与磁盘不一致：</strong>
+  {% if missing_count %}有 {{ missing_count }} 个文件<strong>已不存在</strong>{% endif %}{% if missing_count and changed_count %}，{% endif %}{% if changed_count %}有 {{ changed_count }} 个文件<strong>已被修改</strong>{% endif %}。
+  这通常是审核期间在 NAS 上手工改动了文件。建议重新扫描后再审核；如果坚持现在决定，生成清单时还会再核对一次，不会误删已变化的文件。
+</div>
+{% endif %}
+
 {% if group.kind == 'content' %}
 <div class="notice ok">
   <strong>内容重复：</strong>这些文件的大小和 SHA-256 完全一致，内容逐字节相同。保留任意一份即可，其余可以安全删除。
@@ -49,7 +57,7 @@
     <div><dt>大小</dt><dd>{{ m.size | bytes }}</dd></div>
     <div><dt>修改时间</dt><dd>{{ m.mtime_ns | ts }}</dd></div>
     <div><dt>内容哈希</dt><dd class="mono small">{{ (m.sha256[:16] + '…') if m.sha256 else '尚未计算' }}</dd></div>
-    <div><dt>状态</dt><dd>{% if not m.exists %}<span class="warn">文件已不存在</span>{% elif not m.readable %}<span class="warn">当前不可读</span>{% else %}可读取{% endif %}</dd></div>
+    <div><dt>状态</dt><dd>{% if m.state == 'missing' %}<span class="warn">文件已不存在</span>{% elif m.state == 'changed' %}<span class="warn">文件已被修改</span>{% elif not m.readable %}<span class="warn">当前不可读</span>{% else %}可读取{% endif %}</dd></div>
   </dl>
   <div class="choice">
     <label class="on-keep">

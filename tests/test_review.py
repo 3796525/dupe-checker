@@ -227,3 +227,14 @@ def test_name_group_with_different_content_never_reaches_plan(db, root):
     assert "name_unverified" in reasons
     assert all(v["group_id"] != g["id"] for v in plan["violations"])
 
+
+def test_list_groups_flags_missing_files(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    g = _content_group(db)
+    detail = review.group_detail(db, g["id"])
+    for item in detail["items"]:
+        os.unlink(item["path"])
+    item = next(i for i in review.list_groups(db, kind="content")["items"] if i["id"] == g["id"])
+    assert item["sample_missing"] is True

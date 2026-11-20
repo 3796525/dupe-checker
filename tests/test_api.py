@@ -1,5 +1,6 @@
 """HTTP API: auth/session hardening, guard gating and the read-only review workflow."""
 import importlib
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -537,3 +538,54 @@ def test_needs_review_plan_page_hides_export(client, db, root):
     assert page.status_code == 200
     assert "这份清单不能导出" in page.text
     assert f"/api/v1/delete-plans/{plan_id}/export?format=csv" not in page.text
+
+
+# ---------------------------------------------------------------------------
+# Plan-level recheck + stale-file hints (UAT: files change between review and
+# manual deletion, review pages must say so).
+# ---------------------------------------------------------------------------
+def _approved_plan_via_api(client, db, root, note="recheck"):
+    csrf = _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    keep, delete = detail["items"][0], detail["items"][1]
+    saved = client.put(
+        f"/api/v1/review/groups/{group['id']}",
+        json={"items": [{"item_id": keep["id"], "decision": "keep"},
+                        {"item_id": delete["id"], "decision": "delete"}]},
+        headers={CSRF_HEADER: csrf},
+    )
+    assert saved.status_code == 200
+    made = client.post("/api/v1/delete-plans", json={"note": note}, headers={CSRF_HEADER: csrf})
+    assert made.status_code == 200, made.text
+    return csrf, made.json()["id"], delete["path"]
+
+
+def test_plan_recheck_endpoint_flags_missing_file(client, db, root):
+    csrf, plan_id, delete_path = _approved_plan_via_api(client, db, root)
+    assert "重新校验所有文件" in client.get(f"/delete-plans/{plan_id}").text
+
+    os.unlink(delete_path)
+    resp = client.post(
+        f"/api/v1/delete-plans/{plan_id}/recheck", json={}, headers={CSRF_HEADER: csrf}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "needs_review"
+    assert body["counts"]["missing"] == 1
+    assert "这份清单不能导出" in client.get(f"/delete-plans/{plan_id}").text
+
+
+def test_plan_recheck_requires_auth(client):
+    assert client.post("/api/v1/delete-plans/1/recheck", json={}).status_code == 401
+
+
+def test_review_detail_page_warns_when_file_missing(client, db, root):
+    _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    os.unlink(detail["items"][0]["path"])
+    page = client.get(f"/review/{group['id']}")
+    assert page.status_code == 200
+    assert "索引与磁盘不一致" in page.text
+    assert "文件已不存在" in page.text

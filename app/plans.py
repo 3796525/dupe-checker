@@ -166,6 +166,89 @@ def generate_plan(db: Database, note: str = "") -> dict:
     }
 
 
+def _current_keep(db: Database, group_id: int):
+    return db.query_one(
+        "SELECT * FROM review_items WHERE group_id=? AND decision='keep' "
+        "ORDER BY mtime_ns ASC, path ASC LIMIT 1",
+        (group_id,),
+    )
+
+
+def _keep_state(db: Database, group_id: int, planned_keep_path: str | None) -> dict | None:
+    """Re-validate the keep copy of a planned group (same rule as generate_plan)."""
+    keep = _current_keep(db, group_id)
+    if keep is None:
+        return {"group_id": group_id, "reason": "no_keep"}
+    f = db.query_one("SELECT sha256 FROM files WHERE dev=? AND ino=?", (keep["dev"], keep["ino"]))
+    keep_sha = f["sha256"] if f else None
+    state, _ = recheck_path(keep["path"], keep["size"], keep["mtime_ns"], keep_sha)
+    if state != "consistent":
+        return {"group_id": group_id, "reason": f"keep_{state}"}
+    if planned_keep_path and keep["path"] != planned_keep_path:
+        # The group was re-reviewed after the plan was generated: the plan still
+        # points at the old keep copy, so it must not be exported as-is.
+        return {"group_id": group_id, "reason": "keep_path_changed"}
+    return None
+
+
+def recheck_plan(db: Database, plan_id: int) -> dict | None:
+    """Re-verify every item of an existing plan against the disk, right before
+    the operator deletes anything manually. Never modifies user files."""
+    p = db.query_one("SELECT * FROM delete_plans WHERE id=?", (plan_id,))
+    if p is None:
+        return None
+    items = db.query("SELECT * FROM plan_items WHERE plan_id=? ORDER BY id", (plan_id,))
+    counts = {"consistent": 0, "changed": 0, "missing": 0, "error": 0}
+    violations: list[dict] = []
+    seen_groups: set[int] = set()
+    total = 0
+    total_bytes = 0
+    for item in items:
+        state, _ = recheck_path(item["path"], item["size"], item["mtime_ns"], item["sha256"])
+        counts[state] = counts.get(state, 0) + 1
+        db.execute("UPDATE plan_items SET recheck_status=? WHERE id=?", (state, item["id"]))
+        if state == "consistent":
+            total += 1
+            total_bytes += int(item["size"] or 0)
+        group_id = item["group_id"]
+        if group_id is not None and int(group_id) not in seen_groups:
+            seen_groups.add(int(group_id))
+            violation = _keep_state(db, int(group_id), item["keep_path"])
+            if violation is not None:
+                violation["kind"] = item["kind"]
+                violations.append(violation)
+    clean = counts["changed"] == 0 and counts["missing"] == 0 and counts["error"] == 0
+    if clean and not violations:
+        status = "draft" if p["status"] == "draft" else "final"
+    else:
+        status = "needs_review"
+    db.execute(
+        "UPDATE delete_plans SET status=?, total_items=?, releasable_bytes=? WHERE id=?",
+        (status, total, total_bytes, plan_id),
+    )
+    db.commit()
+    db.audit(
+        "user",
+        "plan.recheck",
+        f"plan={plan_id} status={status} missing={counts['missing']} "
+        f"changed={counts['changed']} violations={len(violations)}",
+    )
+    if p["status"] == "final" and status != "final":
+        db.notify(
+            "plan",
+            "删除清单需要重新复核",
+            f"清单 #{plan_id} 有文件发生变化或保留份缺失，已暂停导出；请重新扫描后再生成清单。",
+        )
+    return {
+        "id": plan_id,
+        "status": status,
+        "counts": counts,
+        "violations": violations,
+        "total_items": total,
+        "releasable_bytes": total_bytes,
+    }
+
+
 def plan_detail(db: Database, plan_id: int) -> dict | None:
     p = db.query_one("SELECT * FROM delete_plans WHERE id=?", (plan_id,))
     if p is None:

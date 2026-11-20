@@ -1,6 +1,8 @@
 """Review workflow: turn duplicate groups into reviewable units with decisions."""
 from __future__ import annotations
 
+import os
+
 from .db import Database, now_iso
 
 KINDS = ("content", "name")
@@ -123,6 +125,17 @@ def _ensure_group(db: Database, kind: str, key: str, members) -> None:
     db.execute("UPDATE review_groups SET updated_at=? WHERE id=?", (now, rg_id))
 
 
+def _path_missing(path: str | None) -> bool:
+    """True when a path recorded in the index no longer exists on disk."""
+    if not path:
+        return False
+    try:
+        os.stat(path, follow_symlinks=False)
+        return False
+    except OSError:
+        return True
+
+
 def list_groups(
     db: Database,
     kind: str | None = None,
@@ -184,6 +197,10 @@ def list_groups(
                 "decided_count": r["decided_count"],
                 "sample_path": r["sample_path"],
                 "keep_path": r["keep_path"],
+                # Cheap spot check (2 stats per row) so the list can flag
+                # groups whose files were deleted outside the tool.
+                "sample_missing": _path_missing(r["sample_path"]),
+                "keep_missing": _path_missing(r["keep_path"]),
             }
         )
     next_cursor = items[-1]["id"] if (len(rows) > limit and items) else None

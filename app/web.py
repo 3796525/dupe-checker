@@ -758,6 +758,15 @@ def api_plan_detail(plan_id: int, request: Request) -> dict:
     return data
 
 
+@app.post("/api/v1/delete-plans/{plan_id}/recheck")
+def api_plan_recheck(plan_id: int, request: Request) -> dict:
+    _require_api(request)
+    data = plans.recheck_plan(db, plan_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
+    return data
+
+
 @app.get("/api/v1/delete-plans/{plan_id}/export")
 def api_plan_export(plan_id: int, request: Request, format: str = "csv"):
     _require_api(request)
@@ -1054,14 +1063,31 @@ def review_detail_page(request: Request, group_id: int):
     if data is None:
         return RedirectResponse("/review", status_code=303)
     members = []
+    missing_count = 0
+    changed_count = 0
     for item in data["items"]:
+        state, exists, reached = "missing", False, False
         try:
-            exists = os.path.exists(item["path"])
+            st = os.stat(item["path"], follow_symlinks=False)
+            exists = True
             reached = os.access(item["path"], os.R_OK)
+            if st.st_size != item["size"] or st.st_mtime_ns != item["mtime_ns"]:
+                state = "changed"
+            else:
+                state = "consistent"
         except OSError:
-            exists, reached = False, False
-        members.append({**item, "exists": exists, "readable": reached})
-    return _page(request, "review_detail.html", group=data, members=members)
+            pass
+        if state == "missing":
+            missing_count += 1
+        elif state == "changed":
+            changed_count += 1
+        members.append(
+            {**item, "exists": exists, "readable": reached, "state": state}
+        )
+    return _page(
+        request, "review_detail.html", group=data, members=members,
+        missing_count=missing_count, changed_count=changed_count,
+    )
 
 
 @app.get("/delete-plans", response_class=HTMLResponse)

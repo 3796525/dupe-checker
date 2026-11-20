@@ -154,3 +154,50 @@ def test_html_export_shows_plan_status_and_kind_text(db, root):
     assert "已通过复核" in text
     assert "内容重复" in text
 
+
+
+# ---------------------------------------------------------------------------
+# plan-level recheck (right before the operator deletes anything manually)
+# ---------------------------------------------------------------------------
+def test_recheck_plan_clean_stays_final(db, root):
+    plan_id, _, _ = _approved_plan(db, root)
+    out = plans.recheck_plan(db, plan_id)
+    assert out["status"] == "final"
+    assert out["counts"] == {"consistent": 1, "changed": 0, "missing": 0, "error": 0}
+    assert out["violations"] == []
+    assert plans.plan_detail(db, plan_id)["status"] == "final"
+
+
+def test_recheck_plan_flags_missing_delete_item(db, root):
+    plan_id, delete_path, _ = _approved_plan(db, root)
+    os.unlink(delete_path)
+    out = plans.recheck_plan(db, plan_id)
+    assert out["status"] == "needs_review"
+    assert out["counts"]["missing"] == 1
+    assert out["total_items"] == 0 and out["releasable_bytes"] == 0
+    assert plans.plan_detail(db, plan_id)["items"][0]["recheck_status"] == "missing"
+    with pytest.raises(exporter.ExportError) as err:
+        exporter.build_export(db, plan_id, "json")
+    assert err.value.code == "PLAN_NOT_FINAL"
+
+
+def test_recheck_plan_detects_missing_keep_copy(db, root):
+    plan_id, _, keep_path = _approved_plan(db, root)
+    os.unlink(keep_path)
+    out = plans.recheck_plan(db, plan_id)
+    assert out["status"] == "needs_review"
+    assert "keep_missing" in [v["reason"] for v in out["violations"]]
+
+
+def test_recheck_plan_detects_changed_content(db, root):
+    plan_id, delete_path, _ = _approved_plan(db, root)
+    size = os.path.getsize(delete_path)
+    with open(delete_path, "wb") as fh:
+        fh.write(b"x" * size)
+    out = plans.recheck_plan(db, plan_id)
+    assert out["counts"]["changed"] == 1
+    assert out["status"] == "needs_review"
+
+
+def test_recheck_plan_missing_plan_returns_none(db):
+    assert plans.recheck_plan(db, 999) is None
