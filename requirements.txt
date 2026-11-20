@@ -1,0 +1,8 @@
+# Runtime dependencies (pinned; see requirements-dev.txt for tests)
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+jinja2==3.1.6
+python-multipart==0.0.34
+bcrypt==5.0.0
+itsdangerous==2.2.0
+pydantic==2.14.4
