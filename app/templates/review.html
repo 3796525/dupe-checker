@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}审核 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>审核</h1>
+<div class="tabs">
+  <a href="/review?kind=content&status=pending" class="{{ 'active' if kind == 'content' }}">内容重复（{{ stats.by_status.get('pending', 0) }} 待审）</a>
+  <a href="/review?kind=name&status=pending" class="{{ 'active' if kind == 'name' }}">同名候选</a>
+</div>
+<div class="row">
+  <a class="button" href="/review?kind={{ kind }}&status=">全部</a>
+  <a class="button" href="/review?kind={{ kind }}&status=pending">待审核</a>
+  <a class="button" href="/review?kind={{ kind }}&status=reviewed">已审核</a>
+  <a class="button" href="/review?kind={{ kind }}&status=skipped">已跳过</a>
+  <a class="button" href="/review?kind={{ kind }}&status=needs_recheck">需复核</a>
+</div>
+
+<table>
+<thead><tr><th>组</th><th>{{ '内容标识' if kind == 'content' else '文件名' }}</th><th>成员</th><th>组内总大小</th><th>状态</th><th></th></tr></thead>
+<tbody>
+{% for g in groups %}
+<tr>
+  <td>#{{ g.id }}</td>
+  <td class="mono small">{{ g.key[:24] if kind == 'content' else g.key }}</td>
+  <td>{{ g.member_count }}</td>
+  <td>{{ (g.group_bytes / 1048576) | round(2) }} MB</td>
+  <td><span class="pill {{ g.status }}">{{ g.status }}</span></td>
+  <td><a class="button" href="/review/{{ g.id }}">审核</a></td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="muted">没有符合条件的分组。先完成一次扫描。</td></tr>
+{% endfor %}
+</tbody></table>
+{% if next_cursor %}<a class="button" href="/review?kind={{ kind }}&status={{ status }}&cursor={{ next_cursor }}">下一页 →</a>{% endif %}
+{% endblock %}

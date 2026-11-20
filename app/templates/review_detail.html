@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}审核 #{{ group.id }} · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>审核分组 #{{ group.id }} <span class="pill {{ group.status }}">{{ group.status }}</span></h1>
+<p class="muted">
+  {% if group.kind == 'content' %}按内容 SHA-256 判定：组内所有文件内容完全一致。{% else %}同名候选：文件名相同，是否内容一致需看哈希（内容不同则不建议删除）。{% endif %}
+  默认保留修改时间最早的一份（{{ group.policy }}）。
+</p>
+
+<table class="review-table">
+<thead><tr><th>保留</th><th>删除</th><th>路径</th><th>大小</th><th>修改时间</th><th>状态</th></tr></thead>
+<tbody>
+{% for m in members %}
+<tr class="{{ 'missing' if not m.exists }}">
+  <td><input type="radio" name="dec_{{$loop.index}}" value="keep" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'keep' }}></td>
+  <td><input type="radio" name="dec_{{$loop.index}}" value="delete" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'delete' }}></td>
+  <td class="mono small">{{ m.path }}</td>
+  <td>{{ (m.size / 1024) | round(1) }} KB</td>
+  <td class="small">{{ m.mtime_ns | ts }}</td>
+  <td>{% if not m.exists %}<span class="warn">文件已不存在</span>{% elif not m.readable %}<span class="warn">不可读</span>{% else %}正常{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody></table>
+
+<div class="row">
+  <button class="primary" onclick="save()">保存决策</button>
+  <button onclick="skip()">整组跳过</button>
+  <button onclick="recheck()">重新比对现状</button>
+  <span id="msg" class="muted"></span>
+</div>
+<pre id="recheck-out" class="small"></pre>
+{% endblock %}
+{% block scripts %}
+<script>
+function items() {
+  const map = {};
+  document.querySelectorAll('input[type=radio]:checked').forEach(r => { map[r.dataset.item] = r.value; });
+  return Object.entries(map).map(([id, d]) => ({item_id: Number(id), decision: d}));
+}
+async function save() {
+  const msg = document.getElementById('msg');
+  const r = await api('PUT', '/api/v1/review/groups/{{ group.id }}', {items: items()});
+  msg.textContent = r.ok ? '已保存：' + r.data.status : ((r.data.error || {}).message || '保存失败');
+  if (r.ok) setTimeout(() => location.href = '/review?kind={{ group.kind }}&status=pending', 600);
+}
+async function skip() {
+  await api('POST', '/api/v1/review/groups/{{ group.id }}/skip', {});
+  location.href = '/review?kind={{ group.kind }}&status=pending';
+}
+async function recheck() {
+  const r = await api('POST', '/api/v1/review/groups/{{ group.id }}/recheck', {});
+  document.getElementById('recheck-out').textContent =
+    (r.data.items || []).map(i => i.state + '  ' + i.path).join('\n');
+}
+</script>
+{% endblock %}

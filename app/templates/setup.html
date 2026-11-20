@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}初始化 · 重复文件核查器{% endblock %}
+{% block content %}
+<div class="card narrow">
+  <h1>首次设置</h1>
+  <p class="muted">设置访问口令（至少 10 位）。此口令只保存在本机数据卷中。</p>
+  <form id="setup-form">
+    <label>口令 <input type="password" name="password" minlength="10" required autofocus></label>
+    <label>再输一次 <input type="password" name="password2" minlength="10" required></label>
+    <button type="submit" class="primary">创建并进入</button>
+    <div class="error" id="err"></div>
+  </form>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('setup-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target, err = document.getElementById('err');
+  err.textContent = '';
+  if (f.password.value !== f.password2.value) { err.textContent = '两次口令不一致'; return; }
+  const r = await api('POST', '/api/v1/auth/setup', {password: f.password.value});
+  if (r.ok) { location.href = '/'; } else { err.textContent = (r.data.error || {}).message || '设置失败'; }
+});
+</script>
+{% endblock %}

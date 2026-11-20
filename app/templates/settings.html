@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}设置 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>设置</h1>
+<div class="card">
+  <h2>只读自检</h2>
+  {% if guard.passed %}
+    <p class="ok">通过：所有扫描根均存在、可读、且写探测被拒绝。</p>
+  {% else %}
+    <p class="warn">未通过！</p>
+  {% endif %}
+  <ul class="small muted">
+    {% for r in guard.roots %}<li>{{ r.path }} — 存在={{ r.exists }} 可读={{ r.readable }} 只读={{ r.readonly }} {{ r.error }}</li>{% endfor %}
+  </ul>
+</div>
+<div class="card">
+  <h2>审核默认策略</h2>
+  <form id="set-form" class="form-grid">
+    <label>默认保留
+      <select name="default_keep_policy">
+        <option value="earliest_mtime" {{ 'selected' if settings.default_keep_policy == 'earliest_mtime' }}>保留修改时间最早</option>
+        <option value="longest_path" {{ 'selected' if settings.default_keep_policy == 'longest_path' }}>保留路径最长（提示用）</option>
+      </select>
+    </label>
+    <label>元数据速率（文件/秒）<input name="rate_meta" type="number" value="{{ settings.rate_meta }}"></label>
+    <label>哈希速率（MB/秒）<input name="rate_hash" type="number" value="{{ settings.rate_hash }}"></label>
+    <div><button class="primary" type="submit">保存</button> <span id="msg" class="muted"></span></div>
+  </form>
+</div>
+<div class="card">
+  <h2>修改口令</h2>
+  <form id="pwd-form" class="form-grid">
+    <label>旧口令 <input type="password" name="old" required></label>
+    <label>新口令 <input type="password" name="new" minlength="10" required></label>
+    <div><button class="primary" type="submit">修改</button> <span id="pwd-msg" class="muted"></span></div>
+  </form>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('set-form').addEventListener('submit', async (e) => {
+  e.preventDefault(); const f = e.target;
+  const r = await api('PUT', '/api/v1/settings', {
+    default_keep_policy: f.default_keep_policy.value,
+    rate_meta: Number(f.rate_meta.value), rate_hash: Number(f.rate_hash.value)
+  });
+  document.getElementById('msg').textContent = r.ok ? '已保存' : '保存失败';
+});
+document.getElementById('pwd-form').addEventListener('submit', async (e) => {
+  e.preventDefault(); const f = e.target;
+  const r = await api('POST', '/api/v1/settings/password', {old_password: f.old.value, new_password: f.new.value});
+  document.getElementById('pwd-msg').textContent = r.ok ? '已修改，请重新登录' : ((r.data.error || {}).message || '失败');
+});
+</script>
+{% endblock %}

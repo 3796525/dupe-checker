@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}概览 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>概览</h1>
+<div class="grid">
+  <div class="stat"><div class="num">{{ overview.files }}</div><div class="label">已索引文件</div></div>
+  <div class="stat"><div class="num">{{ overview.content_groups }}</div><div class="label">内容重复组</div></div>
+  <div class="stat"><div class="num">{{ (overview.wasted_bytes / 1048576) | round(1) }} MB</div><div class="label">潜在可释放</div></div>
+  <div class="stat"><div class="num">{{ overview.review.reviewed }}/{{ overview.review.total_groups }}</div><div class="label">已审核组</div></div>
+</div>
+
+{% if not overview.last_scan %}
+<div class="notice">还没有扫描过。默认不会自动扫描：请先到「扫描方案」创建并手动发起一次扫描。</div>
+{% else %}
+<div class="card">
+  <h2>最近一次扫描</h2>
+  <p>
+    任务 #{{ overview.last_scan.id }} · 状态 <span class="pill {{ overview.last_scan.status }}">{{ overview.last_scan.status }}</span>
+    · 开始 {{ overview.last_scan.started_at }}
+    {% if overview.last_scan.incomplete_reason %}<br><span class="warn">{{ overview.last_scan.incomplete_reason }}</span>{% endif %}
+  </p>
+  <p class="muted">文件 {{ overview.last_scan.stats.files_indexed or 0 }} · 目录 {{ overview.last_scan.dirs_seen or 0 }} · 哈希 {{ overview.last_scan.stats.hashes_computed or 0 }} 个</p>
+  <a href="/review" class="button">去审核</a>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>安全说明</h2>
+  <ul class="muted">
+    <li>所有目录以只读方式挂载，启动时逐目录探测写入，任何目录可写则拒绝启动。</li>
+    <li>本工具没有删除/移动/改名接口，也没有执行命令的接口。</li>
+    <li>「删除方案」只导出待删除清单，请你本人在 NAS 上核对后手工删除。</li>
+  </ul>
+</div>
+{% endblock %}

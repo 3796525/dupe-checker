@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}删除方案 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>删除方案</h1>
+<div class="notice">生成的方案只是一份清单。本工具不会删除任何文件，你需要按清单在 NAS 上核对后手工删除。</div>
+<div class="card">
+  <h2>生成新方案</h2>
+  <p class="muted">只会纳入「已审核」且标记为删除的文件；生成时会逐个重新校验大小、修改时间和 SHA-256。</p>
+  <form id="gen-form" class="row">
+    <input name="note" placeholder="备注（可选）" size="40">
+    <button type="submit" class="primary">生成删除方案</button>
+    <span id="err" class="error"></span>
+  </form>
+</div>
+<table>
+<thead><tr><th>#</th><th>生成时间</th><th>状态</th><th>条目</th><th>可释放</th><th>备注</th><th></th></tr></thead>
+<tbody>
+{% for p in plans %}
+<tr><td>{{ p.id }}</td><td class="small">{{ p.created_at }}</td>
+<td><span class="pill">{{ p.status }}</span></td>
+<td>{{ p.total_items }}</td>
+<td>{{ (p.releasable_bytes / 1048576) | round(1) }} MB</td>
+<td>{{ p.note or '' }}</td>
+<td><a class="button" href="/delete-plans/{{ p.id }}">查看</a></td></tr>
+{% else %}
+<tr><td colspan="7" class="muted">还没有删除方案。先到「审核」完成一些分组的决策。</td></tr>
+{% endfor %}
+</tbody></table>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('gen-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = document.getElementById('err'); err.textContent = '';
+  const r = await api('POST', '/api/v1/delete-plans', {note: e.target.note.value});
+  if (r.ok) location.href = '/delete-plans/' + r.data.id;
+  else err.textContent = (r.data.error || {}).message || '生成失败';
+});
+</script>
+{% endblock %}

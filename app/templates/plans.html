@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}扫描方案 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>扫描方案</h1>
+<p class="muted">默认不扫描。创建方案后需点「立即扫描」或在方案中启用定时触发。</p>
+
+<div class="card">
+  <h2>新建方案</h2>
+  <form id="plan-form" class="form-grid">
+    <label>名称 <input name="name" required placeholder="例如：夜间全量扫描"></label>
+    <label>触发方式
+      <select name="trigger_type">
+        <option value="manual">仅手动</option>
+        <option value="daily">每日定时</option>
+        <option value="weekly">每周定时</option>
+        <option value="interval">自定义间隔</option>
+        <option value="notify_only">仅提醒（不扫描）</option>
+      </select>
+    </label>
+    <label>时间 HH:MM <input name="time" value="02:00" pattern="[0-2][0-9]:[0-5][0-9]"></label>
+    <label>间隔（分钟） <input name="minutes" type="number" min="30" value="1440"></label>
+    <label>扫描窗口开始 <input name="win_start" placeholder="01:00"></label>
+    <label>扫描窗口结束 <input name="win_end" placeholder="05:00"></label>
+    <label>排除规则（逗号分隔） <input name="exclude_globs" placeholder="@eaDir/**,#recycle/**,*.tmp"></label>
+    <label>元数据速率（文件/秒） <input name="rate_meta" type="number" value="2000" min="100"></label>
+    <label>哈希速率（MB/秒） <input name="rate_hash" type="number" value="50" min="1"></label>
+    <fieldset class="full">
+      <legend>扫描目录</legend>
+      {% for r in roots %}
+      <label class="inline"><input type="checkbox" name="root_ids" value="{{ r.id }}" checked> {{ r.label }} <span class="muted small">{{ r.mount_path }}</span></label>
+      {% else %}<p class="muted">没有可用目录</p>{% endfor %}
+    </fieldset>
+    <div class="full"><button type="submit" class="primary">创建方案</button><span class="error" id="err"></span></div>
+  </form>
+</div>
+
+<h2>已有方案</h2>
+{% for p in plans %}
+<div class="card">
+  <h3>{{ p.name }} <span class="pill {{ 'ok' if p.enabled else '' }}">{{ '已启用' if p.enabled else '未启用' }}</span></h3>
+  <p class="muted">触发：{{ p.trigger_type }} {{ p.trigger }} · 目录 {{ p.roots }} · 哈希 {{ p.rate_hash }} MB/s</p>
+  <div class="row">
+    <button class="primary" onclick="runScan({{ p.id }})">立即扫描</button>
+    <button onclick="togglePlan({{ p.id }}, {{ 'false' if p.enabled else 'true' }})">{{ '停用定时' if p.enabled else '启用定时' }}</button>
+    <button class="danger" onclick="deletePlan({{ p.id }})">删除方案</button>
+  </div>
+</div>
+{% else %}
+<p class="muted">还没有方案。</p>
+{% endfor %}
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('plan-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target, err = document.getElementById('err');
+  err.textContent = '';
+  const roots = [...f.querySelectorAll('input[name=root_ids]:checked')].map(x => Number(x.value));
+  if (!roots.length) { err.textContent = '请至少选择一个目录'; return; }
+  const trigger = {};
+  if (f.time.value) trigger.time = f.time.value;
+  if (f.minutes.value) trigger.minutes = Number(f.minutes.value);
+  const body = {
+    name: f.name.value, root_ids: roots, trigger_type: f.trigger_type.value,
+    trigger, include_globs: '', exclude_globs: f.exclude_globs.value,
+    rate_meta: Number(f.rate_meta.value), rate_hash: Number(f.rate_hash.value),
+    window: (f.win_start.value && f.win_end.value) ? {start: f.win_start.value, end: f.win_end.value} : {}
+  };
+  const r = await api('POST', '/api/v1/plans', body);
+  if (r.ok) location.reload(); else err.textContent = (r.data.error || {}).message || '创建失败';
+});
+async function runScan(id) {
+  const r = await api('POST', '/api/v1/scans', {plan_id: id});
+  if (r.ok) location.href = '/scans'; else alert((r.data.error || {}).message || '启动失败');
+}
+async function togglePlan(id, enabled) {
+  await api('PATCH', '/api/v1/plans/' + id, {enabled: enabled}); location.reload();
+}
+async function deletePlan(id) {
+  if (!confirm('删除这个扫描方案？（不会删除任何文件）')) return;
+  await api('DELETE', '/api/v1/plans/' + id, {}); location.reload();
+}
+</script>
+{% endblock %}

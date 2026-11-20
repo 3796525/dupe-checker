@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}重复文件核查器{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css">
+<meta name="csrf" content="{{ csrf or '' }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">🔍 重复文件核查器 <span class="badge">只读</span></a>
+  <nav>
+    <a href="/" class="{{ 'active' if nav == 'index' }}">概览</a>
+    <a href="/roots" class="{{ 'active' if nav == 'roots' }}">目录</a>
+    <a href="/plans" class="{{ 'active' if nav == 'plans' }}">扫描方案</a>
+    <a href="/scans" class="{{ 'active' if nav == 'scans' }}">任务</a>
+    <a href="/review" class="{{ 'active' if nav == 'review' }}">审核</a>
+    <a href="/delete-plans" class="{{ 'active' if nav in ('delete_plans','delete_plan') }}">删除方案</a>
+    <a href="/notifications" class="{{ 'active' if nav == 'notifications' }}">消息</a>
+    <a href="/settings" class="{{ 'active' if nav == 'settings' }}">设置</a>
+  </nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer class="foot">dupe-checker v{{ version }} · 只读扫描 · 本工具不会删除任何文件</footer>
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

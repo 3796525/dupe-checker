@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}消息 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>消息</h1>
+<div class="row"><button onclick="readAll()">全部标记已读</button></div>
+<table>
+<thead><tr><th>时间</th><th>类型</th><th>标题</th><th>内容</th><th>已读</th></tr></thead>
+<tbody>
+{% for n in items %}
+<tr><td class="small">{{ n.created_at }}</td><td>{{ n.kind }}</td><td>{{ n.title }}</td>
+<td class="small">{{ n.body or '' }}</td><td>{{ '✓' if n.read_at else '' }}</td></tr>
+{% else %}
+<tr><td colspan="5" class="muted">暂无消息</td></tr>
+{% endfor %}
+</tbody></table>
+{% endblock %}
+{% block scripts %}
+<script>
+async function readAll() { await api('POST', '/api/v1/notifications/read', {all: true}); location.reload(); }
+</script>
+{% endblock %}

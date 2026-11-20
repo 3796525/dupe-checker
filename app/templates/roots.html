@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}目录 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>已授权目录</h1>
+<p class="muted">这些目录由 NAS 管理员授予受限账号只读权限，并在容器启动时逐条只读挂载。工具无法访问授权范围之外的路径。</p>
+{% for t in trees %}
+<div class="card">
+  <h2>{{ t.root.label }} <span class="muted small">{{ t.root.mount_path }}</span></h2>
+  <div class="chips">
+    {% for e in t.entries %}
+      <span class="chip {{ 'dir' if e.is_dir }}">{{ '📁' if e.is_dir }} {{ e.name }}</span>
+    {% endfor %}
+  </div>
+  {% if not t.entries %}<p class="muted">空目录</p>{% endif %}
+</div>
+{% else %}
+<div class="notice">没有已挂载的扫描根，请检查容器 MOUNT_ROOTS 配置。</div>
+{% endfor %}
+{% endblock %}

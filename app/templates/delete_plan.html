@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}删除方案 #{{ plan.id }} · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>删除方案 #{{ plan.id }} <span class="pill">{{ plan.status }}</span></h1>
+<p class="muted">生成时间 {{ plan.created_at }} · 条目 {{ plan.total_items }} · 可释放 {{ (plan.releasable_bytes / 1048576) | round(1) }} MB</p>
+<div class="notice">请在 NAS 上按下列路径手工核对并删除。标记为 changed / missing 的条目请先重新扫描再处理。</div>
+<div class="row">
+  <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=csv">下载 CSV</a>
+  <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=html">下载 HTML 报告</a>
+  <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=json">下载 JSON</a>
+</div>
+<table>
+<thead><tr><th>待删除路径</th><th>大小</th><th>修改时间</th><th>复核</th><th>保留的文件</th></tr></thead>
+<tbody>
+{% for i in plan.items %}
+<tr class="{{ i.recheck_status }}">
+  <td class="mono small">{{ i.path }}</td>
+  <td>{{ (i.size / 1024) | round(1) }} KB</td>
+  <td class="small">{{ i.mtime_ns | ts }}</td>
+  <td><span class="pill {{ i.recheck_status }}">{{ i.recheck_status }}</span></td>
+  <td class="mono small">{{ i.keep_path }}</td>
+</tr>
+{% endfor %}
+</tbody></table>
+{% endblock %}

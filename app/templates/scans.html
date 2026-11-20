@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}任务 · 重复文件核查器{% endblock %}
+{% block content %}
+<h1>扫描任务</h1>
+<p class="muted">同一时间只运行一个扫描任务；可暂停后继续（从断点恢复）。</p>
+<table>
+<thead><tr><th>#</th><th>状态</th><th>阶段</th><th>开始</th><th>结束</th><th>文件</th><th>目录</th><th>哈希</th><th>操作</th></tr></thead>
+<tbody>
+{% for r in runs %}
+<tr>
+  <td>{{ r.id }}</td>
+  <td><span class="pill {{ r.status }}">{{ r.status }}</span>{% if r.incomplete_reason %}<br><span class="warn small">{{ r.incomplete_reason }}</span>{% endif %}</td>
+  <td>{{ r.phase }}</td>
+  <td class="small">{{ r.started_at }}</td>
+  <td class="small">{{ r.finished_at or '' }}</td>
+  <td>{{ r.stats.files_indexed or 0 }}</td>
+  <td>{{ r.dirs_seen or 0 }}</td>
+  <td>{{ r.stats.hashes_computed or 0 }}</td>
+  <td>
+    {% if r.status == 'running' %}<button onclick="ctrl({{ r.id }},'pause')">暂停</button>
+    <button class="danger" onclick="ctrl({{ r.id }},'cancel')">取消</button>{% endif %}
+    {% if r.status == 'paused' %}<button class="primary" onclick="ctrl({{ r.id }},'resume')">继续</button>
+    <button class="danger" onclick="ctrl({{ r.id }},'cancel')">取消</button>{% endif %}
+    {% if r.error %}<span class="warn small">{{ r.error }}</span>{% endif %}
+  </td>
+</tr>
+{% else %}
+<tr><td colspan="9" class="muted">暂无任务</td></tr>
+{% endfor %}
+</tbody></table>
+{% endblock %}
+{% block scripts %}
+<script>
+async function ctrl(id, action) {
+  const r = await api('POST', '/api/v1/scans/' + id + '/' + action, {});
+  if (!r.ok) alert((r.data.error || {}).message || '操作失败');
+  location.reload();
+}
+setTimeout(() => { if (document.querySelector('.pill.running')) location.reload(); }, 5000);
+</script>
+{% endblock %}
