@@ -62,7 +62,30 @@ def _ts_filter(mtime_ns) -> str:
     return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _bytes_filter(value) -> str:
+    """Render a byte count in a human friendly unit."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return ""
+    units = ("B", "KB", "MB", "GB", "TB")
+    idx = 0
+    while n >= 1024 and idx < len(units) - 1:
+        n /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(n)} B"
+    return f"{n:.1f} {units[idx]}"
+
+
+def _basename_filter(path) -> str:
+    text = str(path or "")
+    return text.rsplit("/", 1)[-1] or text
+
+
 templates.env.filters["ts"] = _ts_filter
+templates.env.filters["bytes"] = _bytes_filter
+templates.env.filters["basename"] = _basename_filter
 
 db = get_db()
 sessions = SessionManager(db)
@@ -796,13 +819,21 @@ def _overview() -> dict:
     groups = db.query_one("SELECT COUNT(*) AS n, COALESCE(SUM(wasted_bytes),0) AS wasted FROM content_groups")
     st = review.stats(db)
     last = db.query_one("SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1")
+    name_groups = db.query_one("SELECT COUNT(*) AS n FROM review_groups WHERE kind='name'")
+    completed = db.query_one("SELECT COUNT(*) AS n FROM scan_runs WHERE status='completed'")
+    roots = db.query_one("SELECT COUNT(*) AS n FROM scan_roots WHERE enabled=1")
+    plans = db.query_one("SELECT COUNT(*) AS n FROM scan_plans")
     return {
         "files": files["n"],
         "total_bytes": files["bytes"],
         "content_groups": groups["n"],
+        "name_groups": int(name_groups["n"]) if name_groups else 0,
         "wasted_bytes": groups["wasted"],
         "review": st,
         "last_scan": _run_row(last) if last else None,
+        "roots": int(roots["n"]) if roots else 0,
+        "plans": int(plans["n"]) if plans else 0,
+        "completed_scans": int(completed["n"]) if completed else 0,
     }
 
 
@@ -817,24 +848,113 @@ def index_page(request: Request):
     return _page(request, "index.html", overview=_overview())
 
 
+def _root_summary(mount_path: str) -> dict:
+    """File counts/sizes per top-level entry, from the last known index."""
+    prefix = mount_path.rstrip("/") + "/"
+    start = len(prefix) + 1  # SQLite substr() is 1-based over characters
+    total = db.query_one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(f.size),0) AS bytes "
+        "FROM file_paths p JOIN files f ON f.dev=p.dev AND f.ino=p.ino "
+        "WHERE f.status='present' AND p.path LIKE ?",
+        (prefix + "%",),
+    )
+    tops = db.query(
+        "SELECT CASE WHEN instr(substr(p.path, ?), '/') > 0 "
+        "THEN substr(p.path, ?, instr(substr(p.path, ?), '/') - 1) "
+        "ELSE '' END AS name, COUNT(*) AS n, COALESCE(SUM(f.size),0) AS bytes "
+        "FROM file_paths p JOIN files f ON f.dev=p.dev AND f.ino=p.ino "
+        "WHERE f.status='present' AND p.path LIKE ? GROUP BY name",
+        (start, start, start, prefix + "%"),
+    )
+    return {
+        "files": int(total["n"]) if total else 0,
+        "bytes": int(total["bytes"]) if total else 0,
+        "tops": [
+            {"name": t["name"] or "", "files": int(t["n"]), "bytes": int(t["bytes"])}
+            for t in tops
+        ],
+    }
+
+
 @app.get("/roots", response_class=HTMLResponse)
 def roots_page(request: Request):
     redir = _require_page(request)
     if redir:
         return redir
     roots = db.query("SELECT * FROM scan_roots WHERE enabled=1 ORDER BY id")
+    guard = _guard_snapshot()
+    guard_by_path = {g.get("path"): g for g in guard.get("roots", [])}
     trees = []
     for r in roots:
         entries = []
         try:
             with os.scandir(r["mount_path"]) as it:
                 for e in it:
-                    entries.append({"name": e.name, "is_dir": e.is_dir(follow_symlinks=False)})
+                    entries.append({
+                        "name": e.name,
+                        "is_dir": e.is_dir(follow_symlinks=False),
+                    })
         except OSError as exc:
             entries = [{"name": f"(无法读取: {exc.strerror})", "is_dir": False}]
         entries.sort(key=lambda x: (not x["is_dir"], x["name"]))
-        trees.append({"root": r, "entries": entries[:200]})
-    return _page(request, "roots.html", trees=trees)
+        summary = _root_summary(r["mount_path"])
+        counts = {t["name"]: t for t in summary["tops"] if t["name"]}
+        merged = []
+        for e in entries:
+            stat = counts.pop(e["name"], None) if e["is_dir"] else None
+            merged.append({
+                "name": e["name"],
+                "is_dir": e["is_dir"],
+                "files": stat["files"] if stat else None,
+                "bytes": stat["bytes"] if stat else None,
+            })
+        # directories that only exist in the index because they were removed later
+        for name, stat in sorted(counts.items(), key=lambda kv: -kv[1]["bytes"])[:20]:
+            merged.append({"name": name, "is_dir": True, "files": stat["files"],
+                           "bytes": stat["bytes"], "stale": True})
+        trees.append({
+            "root": r,
+            "entries": merged[:200],
+            "summary": summary,
+            "guard": guard_by_path.get(r["mount_path"]),
+        })
+    return _page(request, "roots.html", trees=trees, guard=guard)
+
+
+WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+STATUS_TEXT = {
+    "running": "扫描中",
+    "completed": "已完成",
+    "paused": "已暂停",
+    "cancelled": "已取消",
+    "failed": "失败",
+}
+PHASE_TEXT = {
+    "walk": "扫描目录和文件",
+    "hash": "比对文件内容",
+    "group": "整理重复分组",
+    "done": "已完成",
+}
+
+
+def _trigger_text(plan: dict) -> str:
+    trig = plan.get("trigger") or {}
+    ttype = plan.get("trigger_type")
+    if ttype == "manual":
+        return "仅手动发起"
+    if ttype == "daily":
+        return f"每天 {trig.get('time', '02:00')}"
+    if ttype == "weekly":
+        try:
+            day = WEEKDAY_NAMES[int(trig.get("day", 1)) - 1]
+        except (ValueError, IndexError):
+            day = "周一"
+        return f"每{day} {trig.get('time', '02:00')}"
+    if ttype == "interval":
+        return f"每 {trig.get('minutes', 1440)} 分钟"
+    if ttype == "notify_only":
+        return f"每天 {trig.get('time', '02:00')} 提醒（不自动扫描）"
+    return str(ttype)
 
 
 @app.get("/plans", response_class=HTMLResponse)
@@ -843,11 +963,16 @@ def plans_page(request: Request):
     if redir:
         return redir
     roots = db.query("SELECT * FROM scan_roots WHERE enabled=1 ORDER BY id")
-    return _page(
-        request, "plans.html",
-        plans=[_plan_row(r) for r in db.query("SELECT * FROM scan_plans ORDER BY id")],
-        roots=roots,
-    )
+    root_labels = {r["id"]: (r["label"] or r["mount_path"]) for r in roots}
+    rows = []
+    for r in db.query("SELECT * FROM scan_plans ORDER BY id"):
+        item = _plan_row(r)
+        item["trigger_text"] = _trigger_text(item)
+        item["roots_text"] = "、".join(
+            root_labels.get(rid, f"目录 #{rid}") for rid in item["roots"]
+        ) or "全部目录"
+        rows.append(item)
+    return _page(request, "plans.html", plans=rows, roots=roots)
 
 
 @app.get("/scans", response_class=HTMLResponse)
@@ -856,7 +981,18 @@ def scans_page(request: Request):
     if redir:
         return redir
     runs = [_run_row(r) for r in db.query("SELECT * FROM scan_runs ORDER BY id DESC LIMIT 20")]
-    return _page(request, "scans.html", runs=runs)
+    for run in runs:
+        run["phase_text"] = PHASE_TEXT.get(run["phase"], run["phase"])
+        run["status_text"] = STATUS_TEXT.get(run["status"], run["status"])
+    completed = [r for r in runs if r["status"] == "completed"]
+    baseline = int((completed[0]["stats"] or {}).get("files_indexed") or 0) if completed else 0
+    current = next(
+        (r for r in runs if r["status"] in ("running", "paused")), None
+    )
+    return _page(
+        request, "scans.html", runs=runs, baseline=baseline, current=current,
+        status_text=STATUS_TEXT, phase_text=PHASE_TEXT,
+    )
 
 
 @app.get("/review", response_class=HTMLResponse)
@@ -896,7 +1032,10 @@ def delete_plans_page(request: Request):
     redir = _require_page(request)
     if redir:
         return redir
-    return _page(request, "delete_plans.html", plans=plans.list_plans(db))
+    return _page(
+        request, "delete_plans.html",
+        plans=plans.list_plans(db), stats=review.stats(db),
+    )
 
 
 @app.get("/delete-plans/{plan_id}", response_class=HTMLResponse)

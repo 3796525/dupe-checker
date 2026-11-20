@@ -2,43 +2,94 @@
 {% block title %}扫描方案 · 重复文件核查器{% endblock %}
 {% block content %}
 <h1>扫描方案</h1>
-<p class="muted">默认不扫描。创建方案后需点「立即扫描」或在方案中启用定时触发。</p>
+<p class="page-sub">扫描方案决定「扫描哪些目录」和「多久扫一次」。扫描全程只读，不会改动文件；工具默认不会自动扫描，创建后需要你点一次「立即扫描」。</p>
+
+<div class="help">
+  <h3>第一次用？按这个顺序就好</h3>
+  <ol>
+    <li>给方案起个名字（例如「全部目录」）。</li>
+    <li>勾选要扫描的目录。</li>
+    <li>「扫描时机」保持默认的「仅手动」也可以；之后再改成每天/每周。</li>
+    <li>点「创建方案」，然后在方案卡片上点「立即扫描」。</li>
+  </ol>
+</div>
 
 <div class="card">
-  <h2>新建方案</h2>
+  <h2>新建扫描方案</h2>
   <form id="plan-form" class="form-grid">
-    <label>名称 <input name="name" required placeholder="例如：夜间全量扫描"></label>
-    <label>触发方式
-      <select name="trigger_type">
-        <option value="manual">仅手动</option>
-        <option value="daily">每日定时</option>
+    <label class="full">方案名称
+      <input name="name" required value="我的扫描方案" placeholder="例如：全部目录每晚扫描">
+    </label>
+
+    <fieldset class="full">
+      <legend>要扫描哪些目录</legend>
+      {% for r in roots %}
+      <label class="inline">
+        <input type="checkbox" name="root_ids" value="{{ r.id }}" checked>
+        {{ r.label or r.mount_path }}
+        <span class="muted small mono">{{ r.mount_path }}</span>
+      </label>
+      {% else %}
+      <p class="muted">没有可扫描目录，请先到「可扫描目录」检查部署配置。</p>
+      {% endfor %}
+    </fieldset>
+
+    <label>扫描时机
+      <select name="trigger_type" id="trigger-type">
+        <option value="manual">仅手动（推荐，最省电、最不影响 NAS）</option>
+        <option value="daily">每天定时</option>
         <option value="weekly">每周定时</option>
-        <option value="interval">自定义间隔</option>
-        <option value="notify_only">仅提醒（不扫描）</option>
+        <option value="interval">每隔一段时间</option>
+        <option value="notify_only">仅提醒我，不自动扫描</option>
+      </select>
+      <span class="hint">初次使用建议先「仅手动」，确认效果后再改成定时。</span>
+    </label>
+
+    <label id="field-time" style="display:none">几点开始
+      <input name="time" value="02:00" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="02:00">
+    </label>
+    <label id="field-day" style="display:none">星期几
+      <select name="day">
+        <option value="1">周一</option><option value="2">周二</option>
+        <option value="3">周三</option><option value="4">周四</option>
+        <option value="5">周五</option><option value="6">周六</option>
+        <option value="7">周日</option>
       </select>
     </label>
-    <label>时间 HH:MM <input name="time" value="02:00" pattern="[0-2][0-9]:[0-5][0-9]"></label>
-    <label>间隔（分钟） <input name="minutes" type="number" min="30" value="1440"></label>
-    <label>扫描窗口开始 <input name="win_start" placeholder="01:00"></label>
-    <label>扫描窗口结束 <input name="win_end" placeholder="05:00"></label>
-    <label>排除规则（逗号分隔） <input name="exclude_globs" placeholder="@eaDir/**,#recycle/**,*.tmp"></label>
-    <label>元数据速率（文件/秒） <input name="rate_meta" type="number" value="2000" min="100"></label>
-    <label>哈希速率（MB/秒） <input name="rate_hash" type="number" value="50" min="1"></label>
-    <fieldset class="full">
-      <legend>扫描目录</legend>
-      {% for r in roots %}
-      <label class="inline"><input type="checkbox" name="root_ids" value="{{ r.id }}" checked> {{ r.label }} <span class="muted small">{{ r.mount_path }}</span></label>
-      {% else %}<p class="muted">没有可用目录</p>{% endfor %}
-    </fieldset>
-    <div class="full"><button type="submit" class="primary">创建方案</button><span class="error" id="err"></span></div>
+    <label id="field-minutes" style="display:none">间隔（分钟）
+      <input name="minutes" type="number" min="30" value="1440">
+    </label>
+
+    <details class="full">
+      <summary>高级设置<span class="muted small">（不懂就保持默认，不会影响安全）</span></summary>
+      <div class="form-grid">
+        <label>扫描窗口开始 <input name="win_start" placeholder="不限制"></label>
+        <label>扫描窗口结束 <input name="win_end" placeholder="不限制"></label>
+        <label>排除规则（逗号分隔） <input name="exclude_globs" placeholder="@eaDir/**,#recycle/**,*.tmp"></label>
+        <label>元数据速率（文件/秒） <input name="rate_meta" type="number" value="2000" min="100"></label>
+        <label>哈希速率（MB/秒） <input name="rate_hash" type="number" value="50" min="1"></label>
+      </div>
+      <p class="muted small">扫描窗口为空表示不限制；速率用于限制对 NAS 的压力，默认值适合家用 NAS，调低会让扫描更慢但更安静。</p>
+    </details>
+
+    <div class="full row">
+      <button type="submit" class="primary">创建方案</button>
+      <span id="err" class="error"></span>
+    </div>
   </form>
 </div>
 
 <h2>已有方案</h2>
 {% for p in plans %}
 <div class="card">
-  <h3>{{ p.name }} <span class="pill {{ 'ok' if p.enabled else '' }}">{{ '已启用' if p.enabled else '未启用' }}</span></h3>
-  <p class="muted">触发：{{ p.trigger_type }} {{ p.trigger }} · 目录 {{ p.roots }} · 哈希 {{ p.rate_hash }} MB/s</p>
+  <h3>
+    {{ p.name }}
+    <span class="pill {{ 'ok' if p.enabled else '' }}">{{ '定时已启用' if p.enabled else '仅手动' }}</span>
+  </h3>
+  <p class="muted small">
+    扫描时机：{{ p.trigger_text }} · 扫描目录：{{ p.roots_text }}
+    · 速率：{{ p.rate_hash }} MB/s
+  </p>
   <div class="row">
     <button class="primary" onclick="runScan({{ p.id }})">立即扫描</button>
     <button onclick="togglePlan({{ p.id }}, {{ 'false' if p.enabled else 'true' }})">{{ '停用定时' if p.enabled else '启用定时' }}</button>
@@ -46,11 +97,27 @@
   </div>
 </div>
 {% else %}
-<p class="muted">还没有方案。</p>
+<div class="card empty">
+  <h2>还没有方案</h2>
+  <p>创建一个方案后就能开始第一次扫描。</p>
+</div>
 {% endfor %}
 {% endblock %}
 {% block scripts %}
 <script>
+const triggerType = document.getElementById('trigger-type');
+const fieldTime = document.getElementById('field-time');
+const fieldDay = document.getElementById('field-day');
+const fieldMinutes = document.getElementById('field-minutes');
+function syncTriggerFields() {
+  const t = triggerType.value;
+  fieldTime.style.display = (t === 'daily' || t === 'weekly' || t === 'notify_only') ? '' : 'none';
+  fieldDay.style.display = (t === 'weekly') ? '' : 'none';
+  fieldMinutes.style.display = (t === 'interval') ? '' : 'none';
+}
+triggerType.addEventListener('change', syncTriggerFields);
+syncTriggerFields();
+
 document.getElementById('plan-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target, err = document.getElementById('err');
@@ -59,7 +126,8 @@ document.getElementById('plan-form').addEventListener('submit', async (e) => {
   if (!roots.length) { err.textContent = '请至少选择一个目录'; return; }
   const trigger = {};
   if (f.time.value) trigger.time = f.time.value;
-  if (f.minutes.value) trigger.minutes = Number(f.minutes.value);
+  if (f.trigger_type.value === 'weekly') trigger.day = Number(f.day.value);
+  if (f.trigger_type.value === 'interval') trigger.minutes = Number(f.minutes.value);
   const body = {
     name: f.name.value, root_ids: roots, trigger_type: f.trigger_type.value,
     trigger, include_globs: '', exclude_globs: f.exclude_globs.value,
@@ -67,18 +135,21 @@ document.getElementById('plan-form').addEventListener('submit', async (e) => {
     window: (f.win_start.value && f.win_end.value) ? {start: f.win_start.value, end: f.win_end.value} : {}
   };
   const r = await api('POST', '/api/v1/plans', body);
-  if (r.ok) location.reload(); else err.textContent = (r.data.error || {}).message || '创建失败';
+  if (r.ok) location.href = '/plans'; else err.textContent = (r.data.error || {}).message || '创建失败';
 });
 async function runScan(id) {
   const r = await api('POST', '/api/v1/scans', {plan_id: id});
   if (r.ok) location.href = '/scans'; else alert((r.data.error || {}).message || '启动失败');
 }
 async function togglePlan(id, enabled) {
-  await api('PATCH', '/api/v1/plans/' + id, {enabled: enabled}); location.reload();
+  const r = await api('PATCH', '/api/v1/plans/' + id, {enabled: enabled});
+  if (!r.ok) alert((r.data.error || {}).message || '操作失败');
+  location.reload();
 }
 async function deletePlan(id) {
-  if (!confirm('删除这个扫描方案？（不会删除任何文件）')) return;
-  await api('DELETE', '/api/v1/plans/' + id, {}); location.reload();
+  if (!confirm('删除这个扫描方案？只删除方案，不会删除任何文件。')) return;
+  await api('DELETE', '/api/v1/plans/' + id, {});
+  location.reload();
 }
 </script>
 {% endblock %}

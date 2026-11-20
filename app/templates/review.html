@@ -1,12 +1,27 @@
 {% extends "base.html" %}
-{% block title %}审核 · 重复文件核查器{% endblock %}
+{% set status_text = {'pending':'待审核','reviewed':'已审核','skipped':'已跳过','needs_recheck':'需复核'} %}
+{% block title %}审核重复文件 · 重复文件核查器{% endblock %}
 {% block content %}
-<h1>审核</h1>
+<h1>审核重复文件</h1>
+<p class="page-sub">这里把可能重复的文件分成一组一组。你只需决定「每组保留哪一份」，其余标记为可删除；之后才会生成删除清单。</p>
+
+<div class="help">
+  <h3>两种重复，怎么判断？</h3>
+  <ul>
+    <li><strong>内容重复</strong>：文件内容逐字节相同（SHA-256 一致），保留任意一份都不会丢数据，可以放心合并。</li>
+    <li><strong>同名候选</strong>：只是文件名一样，内容可能完全不同。请点开看清路径和大小，<strong>不确定就不要删</strong>。</li>
+    <li>每组至少保留 1 份；工具不会替你删除，最终清单需要你手动执行。</li>
+  </ul>
+</div>
+
 <div class="tabs">
-  <a href="/review?kind=content&status=pending" class="{{ 'active' if kind == 'content' }}">内容重复（{{ stats.by_status.get('pending', 0) }} 待审）</a>
+  <a href="/review?kind=content&status=pending" class="{{ 'active' if kind == 'content' }}">内容重复 <span class="muted small">（推荐先审）</span></a>
   <a href="/review?kind=name&status=pending" class="{{ 'active' if kind == 'name' }}">同名候选</a>
 </div>
+
 <div class="row">
+  <span class="muted small">共 {{ stats.total_groups }} 组 · 待审核 {{ stats.by_status.get('pending', 0) }} 组 · 已审核 {{ stats.by_status.get('reviewed', 0) }} 组</span>
+  <span class="spacer"></span>
   <a class="button" href="/review?kind={{ kind }}&status=">全部</a>
   <a class="button" href="/review?kind={{ kind }}&status=pending">待审核</a>
   <a class="button" href="/review?kind={{ kind }}&status=reviewed">已审核</a>
@@ -14,21 +29,52 @@
   <a class="button" href="/review?kind={{ kind }}&status=needs_recheck">需复核</a>
 </div>
 
+{% if groups %}
+<div class="table-wrap">
 <table>
-<thead><tr><th>组</th><th>{{ '内容标识' if kind == 'content' else '文件名' }}</th><th>成员</th><th>组内总大小</th><th>状态</th><th></th></tr></thead>
+<thead>
+<tr>
+  <th style="width:64px">组</th>
+  <th>{{ '文件示例（内容相同）' if kind == 'content' else '文件名' }}</th>
+  <th>成员</th>
+  <th>组内总大小</th>
+  <th>最多可释放</th>
+  <th>状态</th>
+  <th></th>
+</tr>
+</thead>
 <tbody>
 {% for g in groups %}
 <tr>
   <td>#{{ g.id }}</td>
-  <td class="mono small">{{ g.key[:24] if kind == 'content' else g.key }}</td>
-  <td>{{ g.member_count }}</td>
-  <td>{{ (g.group_bytes / 1048576) | round(2) }} MB</td>
-  <td><span class="pill {{ g.status }}">{{ g.status }}</span></td>
-  <td><a class="button" href="/review/{{ g.id }}">审核</a></td>
+  <td>
+    <div>{{ g.sample_path | basename }}</div>
+    <div class="muted small mono">{{ g.sample_path }}</div>
+  </td>
+  <td>{{ g.member_count }} 份</td>
+  <td>{{ g.group_bytes | bytes }}</td>
+  <td>
+    {% if kind == 'content' %}{{ (g.group_bytes - g.min_size) | bytes }}
+    {% else %}<span class="muted">需人工确认</span>{% endif %}
+  </td>
+  <td><span class="pill {{ g.status }}">{{ status_text.get(g.status, g.status) }}</span></td>
+  <td><a class="button primary" href="/review/{{ g.id }}">开始审核</a></td>
 </tr>
-{% else %}
-<tr><td colspan="6" class="muted">没有符合条件的分组。先完成一次扫描。</td></tr>
 {% endfor %}
-</tbody></table>
+</tbody>
+</table>
+</div>
 {% if next_cursor %}<a class="button" href="/review?kind={{ kind }}&status={{ status }}&cursor={{ next_cursor }}">下一页 →</a>{% endif %}
+{% else %}
+<div class="card empty">
+  <h2>没有符合条件的重复组</h2>
+  {% if status == 'pending' %}
+  <p>可能还没有扫描，或者所有组都已审核完。</p>
+  {% else %}
+  <p>这个状态下暂时没有分组，换个筛选条件看看。</p>
+  {% endif %}
+  <a class="button" href="/scans">查看扫描任务</a>
+  <a class="button" href="/plans">去扫描</a>
+</div>
+{% endif %}
 {% endblock %}

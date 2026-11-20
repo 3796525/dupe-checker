@@ -1,47 +1,128 @@
 {% extends "base.html" %}
+{% set status_text = {'pending':'待审核','reviewed':'已审核','skipped':'已跳过','needs_recheck':'需复核'} %}
 {% block title %}审核 #{{ group.id }} · 重复文件核查器{% endblock %}
 {% block content %}
-<h1>审核分组 #{{ group.id }} <span class="pill {{ group.status }}">{{ group.status }}</span></h1>
-<p class="muted">
-  {% if group.kind == 'content' %}按内容 SHA-256 判定：组内所有文件内容完全一致。{% else %}同名候选：文件名相同，是否内容一致需看哈希（内容不同则不建议删除）。{% endif %}
-  默认保留修改时间最早的一份（{{ group.policy }}）。
+<p class="small"><a href="/review?kind={{ group.kind }}&status=pending">← 返回审核列表</a></p>
+<h1>审核分组 #{{ group.id }} <span class="pill {{ group.status }}">{{ status_text.get(group.status, group.status) }}</span></h1>
+
+{% if group.kind == 'content' %}
+<div class="notice ok">
+  <strong>内容重复：</strong>这些文件的大小和 SHA-256 完全一致，内容逐字节相同。保留任意一份即可，其余可以安全删除。
+</div>
+{% elif group.same_content %}
+<div class="notice ok">
+  <strong>同名且内容相同：</strong>文件名一样，哈希比对也一致，可以按内容重复处理。
+</div>
+{% else %}
+<div class="notice warn">
+  <strong>同名候选（请谨慎）：</strong>这些文件只是文件名一样，内容<strong>并不相同</strong>。删掉哪一份都可能丢失独有内容，建议先打开文件确认，或选择「整组跳过」。
+</div>
+{% endif %}
+
+<p class="muted small">
+  默认建议保留修改时间最早的一份（当前策略：{{ group.policy }}），页面已按建议预选；如不同意，逐项点选修改后再保存。每组至少保留 1 份，工具不会执行删除。
 </p>
 
-<table class="review-table">
-<thead><tr><th>保留</th><th>删除</th><th>路径</th><th>大小</th><th>修改时间</th><th>状态</th></tr></thead>
-<tbody>
-{% for m in members %}
-<tr class="{{ 'missing' if not m.exists }}">
-  <td><input type="radio" name="dec_{{$loop.index}}" value="keep" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'keep' }}></td>
-  <td><input type="radio" name="dec_{{$loop.index}}" value="delete" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'delete' }}></td>
-  <td class="mono small">{{ m.path }}</td>
-  <td>{{ (m.size / 1024) | round(1) }} KB</td>
-  <td class="small">{{ m.mtime_ns | ts }}</td>
-  <td>{% if not m.exists %}<span class="warn">文件已不存在</span>{% elif not m.readable %}<span class="warn">不可读</span>{% else %}正常{% endif %}</td>
-</tr>
-{% endfor %}
-</tbody></table>
-
-<div class="row">
-  <button class="primary" onclick="save()">保存决策</button>
+<div class="bar-actions">
+  <span class="muted small" id="summary">请选择保留的文件</span>
+  <span class="spacer"></span>
+  <button onclick="useSuggestion()">采用建议</button>
+  <button class="primary" id="save-btn" onclick="save()">保存并看下一组</button>
   <button onclick="skip()">整组跳过</button>
-  <button onclick="recheck()">重新比对现状</button>
-  <span id="msg" class="muted"></span>
+  <span id="msg" class="muted small"></span>
 </div>
-<pre id="recheck-out" class="small"></pre>
+
+<div class="file-list">
+{% for m in members %}
+<div class="file-choice {{ 'recommended' if m.id == group.suggested_keep }}">
+  <div class="file-head">
+    <div>
+      <div class="file-name">
+        {{ m.path | basename }}
+        {% if m.id == group.suggested_keep %}<span class="pill ok">建议保留</span>{% endif %}
+        {% if m.decision == 'keep' %}<span class="pill keep">当前保留</span>{% elif m.decision == 'delete' %}<span class="pill delete">当前删除</span>{% endif %}
+      </div>
+      <div class="muted small mono">{{ m.path }}</div>
+    </div>
+  </div>
+  <dl class="kv">
+    <div><dt>大小</dt><dd>{{ m.size | bytes }}</dd></div>
+    <div><dt>修改时间</dt><dd>{{ m.mtime_ns | ts }}</dd></div>
+    <div><dt>内容哈希</dt><dd class="mono small">{{ (m.sha256[:16] + '…') if m.sha256 else '尚未计算' }}</dd></div>
+    <div><dt>状态</dt><dd>{% if not m.exists %}<span class="warn">文件已不存在</span>{% elif not m.readable %}<span class="warn">当前不可读</span>{% else %}可读取{% endif %}</dd></div>
+  </dl>
+  <div class="choice">
+    <label class="on-keep">
+      <input type="radio" name="dec_{{ m.id }}" value="keep" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'keep' or (m.decision == 'undecided' and m.id == group.suggested_keep) }}>
+      ✓ 保留这一份
+    </label>
+    <label class="on-delete">
+      <input type="radio" name="dec_{{ m.id }}" value="delete" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'delete' or (m.decision == 'undecided' and m.id != group.suggested_keep) }}>
+      ✕ 标记为可删除
+    </label>
+  </div>
+</div>
+{% endfor %}
+</div>
+
+<details class="card">
+  <summary>重新比对现状<span class="muted small">（检查文件是否在审核期间被改动）</span></summary>
+  <p class="muted small">这会重新读取磁盘上的文件状态，不会修改任何文件。</p>
+  <button onclick="recheck()">重新比对</button>
+  <pre id="recheck-out" class="small"></pre>
+</details>
 {% endblock %}
 {% block scripts %}
 <script>
-function items() {
-  const map = {};
-  document.querySelectorAll('input[type=radio]:checked').forEach(r => { map[r.dataset.item] = r.value; });
-  return Object.entries(map).map(([id, d]) => ({item_id: Number(id), decision: d}));
+function checkedDecisions() {
+  const out = [];
+  document.querySelectorAll('input[type=radio]:checked').forEach(r => {
+    out.push({item_id: Number(r.dataset.item), decision: r.value});
+  });
+  return out;
+}
+function refreshSummary() {
+  const ds = checkedDecisions();
+  const keeps = ds.filter(d => d.decision === 'keep').length;
+  const deletes = ds.filter(d => d.decision === 'delete').length;
+  const total = document.querySelectorAll('.file-choice').length;
+  const undone = total - ds.length;
+  const el = document.getElementById('summary');
+  el.textContent = '保留 ' + keeps + ' 份 · 标记删除 ' + deletes + ' 份 · 未决定 ' + undone + ' 份';
+  el.className = keeps === 0 ? 'warn small' : 'muted small';
+  document.getElementById('save-btn').disabled = keeps === 0;
+}
+document.querySelectorAll('input[type=radio]').forEach(r => r.addEventListener('change', refreshSummary));
+function useSuggestion() {
+  const suggested = {{ group.suggested_keep or 0 }};
+  document.querySelectorAll('.file-choice').forEach(card => {
+    const radios = card.querySelectorAll('input[type=radio]');
+    if (!radios.length) return;
+    const id = Number(radios[0].dataset.item);
+    const value = id === suggested ? 'keep' : 'delete';
+    radios.forEach(r => { r.checked = (r.value === value); });
+  });
+  refreshSummary();
 }
 async function save() {
+  const ds = checkedDecisions();
+  if (!ds.some(d => d.decision === 'keep')) {
+    document.getElementById('msg').textContent = '请至少保留 1 份';
+    return;
+  }
   const msg = document.getElementById('msg');
-  const r = await api('PUT', '/api/v1/review/groups/{{ group.id }}', {items: items()});
-  msg.textContent = r.ok ? '已保存：' + r.data.status : ((r.data.error || {}).message || '保存失败');
-  if (r.ok) setTimeout(() => location.href = '/review?kind={{ group.kind }}&status=pending', 600);
+  msg.textContent = '保存中…';
+  const r = await api('PUT', '/api/v1/review/groups/{{ group.id }}', {items: ds});
+  if (!r.ok) { msg.textContent = (r.data.error || {}).message || '保存失败'; return; }
+  msg.textContent = '已保存，正在打开下一组…';
+  const next = await api('GET', '/api/v1/review/groups?kind={{ group.kind }}&status=pending&limit=1');
+  const items = (next.ok && next.data.items) || [];
+  const nextId = items.length ? items[0].id : null;
+  if (nextId && nextId !== {{ group.id }}) {
+    location.href = '/review/' + nextId;
+  } else {
+    location.href = '/review?kind={{ group.kind }}&status=pending';
+  }
 }
 async function skip() {
   await api('POST', '/api/v1/review/groups/{{ group.id }}/skip', {});
@@ -49,8 +130,13 @@ async function skip() {
 }
 async function recheck() {
   const r = await api('POST', '/api/v1/review/groups/{{ group.id }}/recheck', {});
-  document.getElementById('recheck-out').textContent =
-    (r.data.items || []).map(i => i.state + '  ' + i.path).join('\n');
+  const out = document.getElementById('recheck-out');
+  if (!r.ok) { out.textContent = (r.data.error || {}).message || '比对失败'; return; }
+  out.textContent = (r.data.items || []).map(i => {
+    const names = {consistent: '未变化', changed: '已被修改', missing: '已不存在', unreadable: '不可读'};
+    return (names[i.state] || i.state) + '  ' + i.path;
+  }).join('\n');
 }
+refreshSummary();
 </script>
 {% endblock %}

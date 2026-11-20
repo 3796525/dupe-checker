@@ -136,7 +136,13 @@ def list_groups(
     sql = [
         "SELECT g.*, COUNT(i.id) AS member_count, "
         "COALESCE(SUM(CASE WHEN i.decision='delete' THEN i.size ELSE 0 END),0) AS planned_bytes, "
-        "COALESCE(SUM(i.size),0) AS group_bytes "
+        "COALESCE(SUM(i.size),0) AS group_bytes, "
+        "COALESCE(MIN(i.size),0) AS min_size, "
+        "COALESCE(SUM(CASE WHEN i.decision!='undecided' THEN 1 ELSE 0 END),0) AS decided_count, "
+        "(SELECT s.path FROM review_items s WHERE s.group_id=g.id "
+        " ORDER BY s.mtime_ns ASC, s.path ASC LIMIT 1) AS sample_path, "
+        "(SELECT s.path FROM review_items s WHERE s.group_id=g.id AND s.decision='keep' "
+        " ORDER BY s.mtime_ns ASC, s.path ASC LIMIT 1) AS keep_path "
         "FROM review_groups g LEFT JOIN review_items i ON i.group_id=g.id WHERE 1=1"
     ]
     params: list = []
@@ -174,6 +180,10 @@ def list_groups(
                 "member_count": r["member_count"],
                 "planned_bytes": r["planned_bytes"],
                 "group_bytes": r["group_bytes"],
+                "min_size": r["min_size"],
+                "decided_count": r["decided_count"],
+                "sample_path": r["sample_path"],
+                "keep_path": r["keep_path"],
             }
         )
     next_cursor = items[-1]["id"] if (len(rows) > limit and items) else None
@@ -184,26 +194,34 @@ def group_detail(db: Database, group_id: int) -> dict | None:
     g = db.query_one("SELECT * FROM review_groups WHERE id=?", (group_id,))
     if g is None:
         return None
-    items = db.query(
-        "SELECT * FROM review_items WHERE group_id=? ORDER BY mtime_ns ASC, path ASC",
+    rows = db.query(
+        "SELECT i.*, f.sha256 AS sha256 FROM review_items i "
+        "LEFT JOIN files f ON f.dev=i.dev AND f.ino=i.ino "
+        "WHERE i.group_id=? ORDER BY i.mtime_ns ASC, i.path ASC",
         (group_id,),
     )
+    items = [
+        {
+            "id": i["id"],
+            "path": i["path"],
+            "size": i["size"],
+            "mtime_ns": i["mtime_ns"],
+            "decision": i["decision"],
+            "sha256": i["sha256"],
+        }
+        for i in rows
+    ]
+    hashes = {i["sha256"] for i in items if i["sha256"]}
+    same_content = bool(items) and all(i["sha256"] for i in items) and len(hashes) == 1
     return {
         "id": g["id"],
         "kind": g["kind"],
         "key": g["group_key"],
         "status": g["status"],
         "policy": g["policy"],
-        "items": [
-            {
-                "id": i["id"],
-                "path": i["path"],
-                "size": i["size"],
-                "mtime_ns": i["mtime_ns"],
-                "decision": i["decision"],
-            }
-            for i in items
-        ],
+        "items": items,
+        "same_content": same_content,
+        "suggested_keep": items[0]["id"] if items else None,
     }
 
 

@@ -1,31 +1,57 @@
 {% extends "base.html" %}
-{% block title %}删除方案 · 重复文件核查器{% endblock %}
+{% block title %}删除清单 · 重复文件核查器{% endblock %}
 {% block content %}
-<h1>删除方案</h1>
-<div class="notice">生成的方案只是一份清单。本工具不会删除任何文件，你需要按清单在 NAS 上核对后手工删除。</div>
+<h1>删除清单</h1>
+<p class="page-sub">删除清单是一份「建议删除的文件列表」，用来告诉你在 NAS 上哪些文件可以手工删掉。工具<strong>不会</strong>删除、移动或修改任何文件。</p>
+
+<div class="help">
+  <h3>怎么用？</h3>
+  <ol>
+    <li>先在「审核重复」里完成一些分组的审核（至少保留一份）。</li>
+    <li>点下面「生成删除清单」，工具会重新检查每个待删文件是否仍然和审核时一致。</li>
+    <li>下载 CSV/HTML/JSON，按里面的路径在飞牛 NAS 上手工删除；删除前请再看一眼「保留的文件」是否还在。</li>
+  </ol>
+  <p class="muted small">状态为「需复核」的清单不会允许导出：说明有文件在审核后被改动/丢失，请重新扫描并审核。</p>
+</div>
+
 <div class="card">
-  <h2>生成新方案</h2>
-  <p class="muted">只会纳入「已审核」且标记为删除的文件；生成时会逐个重新校验大小、修改时间和 SHA-256。</p>
+  <h2>生成新清单</h2>
+  <p class="muted small">将纳入「已审核」且标记为可删除的文件，共 {{ stats.by_status.get('reviewed', 0) }} 个已审核分组可供使用。</p>
   <form id="gen-form" class="row">
-    <input name="note" placeholder="备注（可选）" size="40">
-    <button type="submit" class="primary">生成删除方案</button>
+    <input name="note" placeholder="备注（可选，例如：第一批清理）" size="40">
+    <button type="submit" class="primary">生成删除清单</button>
     <span id="err" class="error"></span>
   </form>
 </div>
+
+<h2>历史清单</h2>
+{% if plans %}
+<div class="table-wrap">
 <table>
 <thead><tr><th>#</th><th>生成时间</th><th>状态</th><th>条目</th><th>可释放</th><th>备注</th><th></th></tr></thead>
 <tbody>
 {% for p in plans %}
-<tr><td>{{ p.id }}</td><td class="small">{{ p.created_at }}</td>
-<td><span class="pill">{{ p.status }}</span></td>
-<td>{{ p.total_items }}</td>
-<td>{{ (p.releasable_bytes / 1048576) | round(1) }} MB</td>
-<td>{{ p.note or '' }}</td>
-<td><a class="button" href="/delete-plans/{{ p.id }}">查看</a></td></tr>
-{% else %}
-<tr><td colspan="7" class="muted">还没有删除方案。先到「审核」完成一些分组的决策。</td></tr>
+<tr>
+  <td>{{ p.id }}</td>
+  <td class="small">{{ p.created_at }}</td>
+  <td>
+    <span class="pill {{ p.status }}">{{ '可导出' if p.status == 'final' else '需复核' }}</span>
+  </td>
+  <td>{{ p.total_items }}</td>
+  <td>{{ p.releasable_bytes | bytes }}</td>
+  <td>{{ p.note or '—' }}</td>
+  <td><a class="button" href="/delete-plans/{{ p.id }}">查看</a></td>
+</tr>
 {% endfor %}
 </tbody></table>
+</div>
+{% else %}
+<div class="card empty">
+  <h2>还没有删除清单</h2>
+  <p>先到「审核重复」完成一些分组的审核，再回来生成清单。</p>
+  <a class="button primary" href="/review?kind=content&status=pending">去审核内容重复</a>
+</div>
+{% endif %}
 {% endblock %}
 {% block scripts %}
 <script>

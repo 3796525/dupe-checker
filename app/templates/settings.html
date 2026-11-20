@@ -2,54 +2,90 @@
 {% block title %}设置 · 重复文件核查器{% endblock %}
 {% block content %}
 <h1>设置</h1>
+<p class="page-sub">这里可以查看安全自检结果、调整审核默认策略和修改登录口令。</p>
+
 <div class="card">
-  <h2>只读自检</h2>
+  <h2>只读安全自检</h2>
+  <p class="muted small">工具启动时和运行期间会检查每个扫描目录是否真的「不可写」。如果不通过，扫描和导出会被自动暂停，避免在可写目录上误操作。</p>
   {% if guard.passed %}
-    <p class="ok">通过：所有扫描根均存在、可读、且写探测被拒绝。</p>
+    <div class="notice ok">通过：所有扫描目录都存在、可读，且写入测试被拒绝。</div>
   {% else %}
-    <p class="warn">未通过！</p>
+    <div class="notice warn">未通过：请检查目录挂载权限后再使用扫描功能。</div>
   {% endif %}
-  {% if guard.unsafe %}<p class="warn">只读自检失败：已暂停扫描与导出（{{ guard.unsafe_reason }}）。</p>{% endif %}
-  <p class="small muted">最近一次自检：{{ guard.verified_at or '未知' }}</p>
-  <ul class="small muted">
-    {% for r in guard.roots %}<li>{{ r.path }} — 存在={{ r.exists }} 可读={{ r.readable }} 只读={{ r.readonly }} 嵌套检查={{ r.nested_checked }}{% if r.nested_writable %} 可写子目录={{ r.nested_writable }}{% endif %} {{ r.error }}</li>{% endfor %}
-  </ul>
+  {% if guard.unsafe %}<p class="warn">当前为安全暂停状态：{{ guard.unsafe_reason }}</p>{% endif %}
+  <p class="small muted">最近一次自检：{{ guard.verified_at or '尚未检查' }}</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>扫描目录</th><th>存在</th><th>可读</th><th>确认只读</th><th>抽查子目录</th><th>说明</th></tr></thead>
+    <tbody>
+    {% for r in guard.roots %}
+    <tr>
+      <td class="mono small">{{ r.path }}</td>
+      <td>{{ '是' if r.exists else '否' }}</td>
+      <td>{{ '是' if r.readable else '否' }}</td>
+      <td>{{ '是' if r.readonly else '否' }}</td>
+      <td>{{ r.nested_checked }}</td>
+      <td class="small">{% if r.nested_writable %}<span class="warn">发现可写子目录：{{ r.nested_writable }}</span>{% else %}{{ r.error or '正常' }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
 </div>
+
 <div class="card">
   <h2>审核默认策略</h2>
   <form id="set-form" class="form-grid">
-    <label>默认保留
+    <label>默认建议保留
       <select name="default_keep_policy">
-        <option value="earliest_mtime" {{ 'selected' if settings.default_keep_policy == 'earliest_mtime' }}>保留修改时间最早</option>
-        <option value="longest_path" {{ 'selected' if settings.default_keep_policy == 'longest_path' }}>保留路径最长（提示用）</option>
+        <option value="earliest_mtime" {{ 'selected' if settings.default_keep_policy == 'earliest_mtime' }}>修改时间最早的一份（推荐）</option>
+        <option value="longest_path" {{ 'selected' if settings.default_keep_policy == 'longest_path' }}>路径最长的一份（仅作提示）</option>
       </select>
+      <span class="hint">这只是审核页的「建议」预选，最终以你的选择为准。</span>
     </label>
+    <div><button class="primary" type="submit">保存</button> <span id="msg" class="muted small"></span></div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>修改登录口令</h2>
+  <form id="pwd-form" class="form-grid">
+    <label>当前口令 <input type="password" name="old" required autocomplete="current-password"></label>
+    <label>新口令（至少 10 位） <input type="password" name="new" minlength="10" required autocomplete="new-password"></label>
+    <div><button class="primary" type="submit">修改</button> <span id="pwd-msg" class="muted small"></span></div>
+  </form>
+</div>
+
+<details class="card">
+  <summary>高级：扫描速率</summary>
+  <p class="muted small">用于限制扫描对 NAS 的压力；默认值适合家用 NAS。调低会更慢更安静，调高会更快但占用更多磁盘性能。</p>
+  <form id="rate-form" class="form-grid">
     <label>元数据速率（文件/秒）<input name="rate_meta" type="number" value="{{ settings.rate_meta }}"></label>
     <label>哈希速率（MB/秒）<input name="rate_hash" type="number" value="{{ settings.rate_hash }}"></label>
-    <div><button class="primary" type="submit">保存</button> <span id="msg" class="muted"></span></div>
+    <div><button type="submit">保存速率</button> <span id="rate-msg" class="muted small"></span></div>
   </form>
-</div>
-<div class="card">
-  <h2>修改口令</h2>
-  <form id="pwd-form" class="form-grid">
-    <label>旧口令 <input type="password" name="old" required></label>
-    <label>新口令 <input type="password" name="new" minlength="10" required></label>
-    <div><button class="primary" type="submit">修改</button> <span id="pwd-msg" class="muted"></span></div>
-  </form>
-</div>
+</details>
 {% endblock %}
 {% block scripts %}
 <script>
 document.getElementById('set-form').addEventListener('submit', async (e) => {
-  e.preventDefault(); const f = e.target;
+  e.preventDefault();
   const r = await api('PUT', '/api/v1/settings', {
-    default_keep_policy: f.default_keep_policy.value,
-    rate_meta: Number(f.rate_meta.value), rate_hash: Number(f.rate_hash.value)
+    default_keep_policy: e.target.default_keep_policy.value,
   });
   document.getElementById('msg').textContent = r.ok ? '已保存' : '保存失败';
 });
+document.getElementById('rate-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const r = await api('PUT', '/api/v1/settings', {
+    rate_meta: Number(f.rate_meta.value), rate_hash: Number(f.rate_hash.value),
+  });
+  document.getElementById('rate-msg').textContent = r.ok ? '已保存' : '保存失败';
+});
 document.getElementById('pwd-form').addEventListener('submit', async (e) => {
-  e.preventDefault(); const f = e.target;
+  e.preventDefault();
+  const f = e.target;
   const r = await api('POST', '/api/v1/settings/password', {old_password: f.old.value, new_password: f.new.value});
   document.getElementById('pwd-msg').textContent = r.ok ? '已修改，请重新登录' : ((r.data.error || {}).message || '失败');
 });

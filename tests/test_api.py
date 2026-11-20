@@ -19,7 +19,7 @@ from app.security import (
     ensure_setup_token,
     setup_token_path,
 )
-from helpers import add_root, build_tree
+from helpers import add_root, build_tree, run_scan
 
 PASSWORD = "test-password-123"
 TEST_SETUP_TOKEN = "test-setup-token-6f4c2a"
@@ -367,3 +367,107 @@ def test_health_endpoint_is_public(client):
     resp = client.get("/api/v1/system/version")
     assert resp.status_code == 200
     assert resp.json()["name"] == "dupe-checker"
+
+
+# ---------------------------------------------------------------------------
+# Human-facing pages: the review detail page used to 500 on a template typo
+# ({{$loop.index}}), so every page is now rendered in the test suite.
+# ---------------------------------------------------------------------------
+def _prepared_scan(client, db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    return login(client)
+
+
+def _groups(client, kind="content", status="pending"):
+    resp = client.get("/api/v1/review/groups", params={"kind": kind, "status": status})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["items"]
+
+
+def test_all_pages_render_after_scan(client, db, root):
+    _prepared_scan(client, db, root)
+    for path in ("/", "/roots", "/plans", "/scans", "/review",
+                 "/delete-plans", "/settings", "/notifications"):
+        resp = client.get(path)
+        assert resp.status_code == 200, f"{path}: {resp.status_code} {resp.text[:400]}"
+    assert "开始使用" in client.get("/").text
+    assert "怎么用" in client.get("/delete-plans").text
+
+
+def test_review_detail_content_group_renders(client, db, root):
+    _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    assert detail["same_content"] is True
+    assert detail["suggested_keep"] == detail["items"][0]["id"]
+
+    page = client.get(f"/review/{group['id']}")
+    assert page.status_code == 200
+    assert "内容重复" in page.text
+    assert "保留这一份" in page.text
+    assert "采用建议" in page.text
+
+
+def test_review_detail_name_group_warns_about_different_content(client, db, root):
+    _prepared_scan(client, db, root)
+    group = _groups(client, kind="name")[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    assert detail["same_content"] is False
+    page = client.get(f"/review/{group['id']}")
+    assert page.status_code == 200
+    assert "同名候选（请谨慎）" in page.text
+
+
+def test_delete_plan_pages_render(client, db, root):
+    csrf = _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    keep, delete = detail["items"][0], detail["items"][1]
+    saved = client.put(
+        f"/api/v1/review/groups/{group['id']}",
+        json={"items": [{"item_id": keep["id"], "decision": "keep"},
+                        {"item_id": delete["id"], "decision": "delete"}]},
+        headers={CSRF_HEADER: csrf},
+    )
+    assert saved.status_code == 200
+    made = client.post("/api/v1/delete-plans", json={"note": "ui"}, headers={CSRF_HEADER: csrf})
+    assert made.status_code == 200, made.text
+    plan_id = made.json()["id"]
+
+    listing = client.get("/delete-plans")
+    assert listing.status_code == 200 and f"/delete-plans/{plan_id}" in listing.text
+
+    page = client.get(f"/delete-plans/{plan_id}")
+    assert page.status_code == 200
+    assert "待删除文件" in page.text
+    assert "下载 CSV" in page.text
+    assert "rm -rf" not in page.text and "unlink(" not in page.text
+
+
+def test_needs_review_plan_page_hides_export(client, db, root):
+    csrf = _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    keep, delete = detail["items"][0], detail["items"][1]
+    saved = client.put(
+        f"/api/v1/review/groups/{group['id']}",
+        json={"items": [{"item_id": keep["id"], "decision": "keep"},
+                        {"item_id": delete["id"], "decision": "delete"}]},
+        headers={CSRF_HEADER: csrf},
+    )
+    assert saved.status_code == 200
+    # touch the file after review: the plan must flag it and forbid export
+    with open(delete["path"], "ab") as fh:
+        fh.write(b"changed-after-review")
+
+    made = client.post("/api/v1/delete-plans", json={"note": "ui"}, headers={CSRF_HEADER: csrf})
+    assert made.status_code == 200, made.text
+    assert made.json()["status"] == "needs_review"
+    plan_id = made.json()["id"]
+
+    page = client.get(f"/delete-plans/{plan_id}")
+    assert page.status_code == 200
+    assert "这份清单不能导出" in page.text
+    assert f"/api/v1/delete-plans/{plan_id}/export?format=csv" not in page.text

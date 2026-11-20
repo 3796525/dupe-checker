@@ -1,35 +1,87 @@
 {% extends "base.html" %}
+{% set status_text = {'running':'扫描中','completed':'已完成','paused':'已暂停','cancelled':'已取消','failed':'失败'} %}
+{% set phase_text = {'walk':'扫描目录和文件','hash':'比对文件内容','group':'整理重复分组','done':'已完成'} %}
+{% set pending = overview.review.by_status.get('pending', 0) %}
 {% block title %}概览 · 重复文件核查器{% endblock %}
 {% block content %}
 <h1>概览</h1>
-<div class="grid">
-  <div class="stat"><div class="num">{{ overview.files }}</div><div class="label">已索引文件</div></div>
-  <div class="stat"><div class="num">{{ overview.content_groups }}</div><div class="label">内容重复组</div></div>
-  <div class="stat"><div class="num">{{ (overview.wasted_bytes / 1048576) | round(1) }} MB</div><div class="label">潜在可释放</div></div>
-  <div class="stat"><div class="num">{{ overview.review.reviewed }}/{{ overview.review.total_groups }}</div><div class="label">已审核组</div></div>
+<p class="page-sub">找到重复文件 → 由你审核确认 → 生成清单后手动删除。整个过程只读，本工具不会动你的文件。</p>
+
+{% if overview.roots == 0 %}
+<div class="notice">
+  还没有可扫描的目录。请先在 NAS 上给受限账号授权目录，再在部署配置中添加只读挂载；遇到问题请查看「可扫描目录」页面。
+</div>
+{% endif %}
+
+<h2>开始使用</h2>
+<div class="steps">
+  <div class="step {{ 'done' if overview.roots > 0 else 'current' }}">
+    <div class="n">{{ '✓' if overview.roots > 0 else '1' }}</div>
+    <h3>确认可扫描目录</h3>
+    <p>检查工具能看到哪些目录，以及它们是否已按只读方式挂载。</p>
+    <a class="button" href="/roots">查看目录</a>
+  </div>
+  <div class="step {{ 'done' if overview.completed_scans > 0 else ('current' if overview.roots > 0 else '') }}">
+    <div class="n">{{ '✓' if overview.completed_scans > 0 else '2' }}</div>
+    <h3>创建方案并扫描</h3>
+    <p>默认不会自动扫描。创建一个方案，选择目录和扫描频率，然后手动发起一次。</p>
+    <a class="button" href="/plans">去创建扫描方案</a>
+  </div>
+  <div class="step {{ 'done' if overview.review.reviewed > 0 else ('current' if overview.completed_scans > 0 else '') }}">
+    <div class="n">{{ '✓' if overview.review.reviewed > 0 else '3' }}</div>
+    <h3>审核并生成删除清单</h3>
+    <p>逐组确认保留哪一份；审核完成后生成清单，再到 NAS 上手动删除。</p>
+    <a class="button" href="/review">去审核重复文件</a>
+  </div>
 </div>
 
-{% if not overview.last_scan %}
-<div class="notice">还没有扫描过。默认不会自动扫描：请先到「扫描方案」创建并手动发起一次扫描。</div>
-{% else %}
+<div class="grid">
+  <div class="stat"><div class="num">{{ overview.files }}</div><div class="label">已索引文件</div><div class="hint">上次扫描建立的索引</div></div>
+  <div class="stat"><div class="num">{{ overview.content_groups }}</div><div class="label">内容重复组</div><div class="hint">内容完全相同，可安全合并</div></div>
+  <div class="stat"><div class="num">{{ overview.name_groups }}</div><div class="label">同名候选组</div><div class="hint">名字一样，内容需人工确认</div></div>
+  <div class="stat"><div class="num">{{ (overview.wasted_bytes / 1048576) | round(1) }} MB</div><div class="label">潜在可释放空间</div><div class="hint">仅统计内容重复组</div></div>
+  <div class="stat"><div class="num">{{ pending }}</div><div class="label">待审核组</div><div class="hint">已审核 {{ overview.review.reviewed }} 组</div></div>
+</div>
+
+{% if pending > 0 %}
+<div class="notice">有 <strong>{{ pending }}</strong> 组重复文件等待审核。建议从「内容重复」开始，这类文件内容完全一致，判断最可靠。</div>
+{% endif %}
+
+{% if overview.last_scan %}
 <div class="card">
   <h2>最近一次扫描</h2>
   <p>
-    任务 #{{ overview.last_scan.id }} · 状态 <span class="pill {{ overview.last_scan.status }}">{{ overview.last_scan.status }}</span>
-    · 开始 {{ overview.last_scan.started_at }}
-    {% if overview.last_scan.incomplete_reason %}<br><span class="warn">{{ overview.last_scan.incomplete_reason }}</span>{% endif %}
+    任务 #{{ overview.last_scan.id }} ·
+    <span class="pill {{ overview.last_scan.status }}">{{ status_text.get(overview.last_scan.status, overview.last_scan.status) }}</span>
+    · 当前阶段：{{ phase_text.get(overview.last_scan.phase, overview.last_scan.phase) }}
+    · 开始于 {{ overview.last_scan.started_at }}
   </p>
-  <p class="muted">文件 {{ overview.last_scan.stats.files_indexed or 0 }} · 目录 {{ overview.last_scan.dirs_seen or 0 }} · 哈希 {{ overview.last_scan.stats.hashes_computed or 0 }} 个</p>
-  <a href="/review" class="button">去审核</a>
+  <p class="muted small">
+    已看到文件 {{ overview.last_scan.stats.files_indexed or 0 }} 个 · 目录 {{ overview.last_scan.dirs_seen or 0 }} 个 ·
+    已计算哈希 {{ overview.last_scan.stats.hashes_computed or 0 }} 个
+  </p>
+  {% if overview.last_scan.incomplete_reason %}<p class="warn">{{ overview.last_scan.incomplete_reason }}</p>{% endif %}
+  {% if overview.last_scan.error %}<p class="error">{{ overview.last_scan.error }}</p>{% endif %}
+  <div class="row">
+    <a class="button" href="/scans">查看扫描进度</a>
+    {% if overview.review.total_groups > 0 %}<a class="button primary" href="/review">去审核</a>{% endif %}
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <h2>还没有扫描过</h2>
+  <p class="muted">工具不会自动扫描。请先创建扫描方案，然后在方案上点「立即扫描」。</p>
+  <a class="button primary" href="/plans">创建扫描方案</a>
 </div>
 {% endif %}
 
 <div class="card">
   <h2>安全说明</h2>
   <ul class="muted">
-    <li>所有目录以只读方式挂载，启动时逐目录探测写入，任何目录可写则拒绝启动。</li>
-    <li>本工具没有删除/移动/改名接口，也没有执行命令的接口。</li>
-    <li>「删除方案」只导出待删除清单，请你本人在 NAS 上核对后手工删除。</li>
+    <li>所有目录都以<strong>只读</strong>方式挂载；启动和运行期间会反复探测写入，一旦发现可写就暂停扫描与导出。</li>
+    <li>工具没有删除、移动、改名的接口，也没有执行命令的接口。</li>
+    <li>「删除清单」只是导出一份清单，<strong>需要你本人在 NAS 上核对后手动删除</strong>。</li>
+    <li>审核时每组必须至少保留 1 份；导出前会重新核对保留文件是否仍存在、是否被改动。</li>
   </ul>
 </div>
 {% endblock %}

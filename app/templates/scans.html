@@ -1,18 +1,64 @@
 {% extends "base.html" %}
-{% block title %}任务 · 重复文件核查器{% endblock %}
+{% block title %}扫描任务 · 重复文件核查器{% endblock %}
 {% block content %}
 <h1>扫描任务</h1>
-<p class="muted">同一时间只运行一个扫描任务；可暂停后继续（从断点恢复）。</p>
+<p class="page-sub">扫描分三步：先记录文件信息，再比对内容，最后整理出重复分组。同一时间只运行一个任务，可暂停后从断点继续。</p>
+
+{% if current %}
+{% set phase_order = ['walk', 'hash', 'group', 'done'] %}
+{% set idx = phase_order.index(current.phase) if current.phase in phase_order else 0 %}
+<div class="card" id="live-card" data-baseline="{{ baseline }}">
+  <h2>
+    正在扫描任务 #{{ current.id }}
+    <span class="pill {{ current.status }}">{{ status_text.get(current.status, current.status) }}</span>
+  </h2>
+  <div class="phase-steps">
+    <span class="{{ 'done' if idx > 0 else ('active' if idx == 0 else '') }}">① 扫描目录和文件</span>
+    <span class="{{ 'done' if idx > 1 else ('active' if idx == 1 else '') }}">② 比对文件内容</span>
+    <span class="{{ 'done' if idx > 2 else ('active' if idx == 2 else '') }}">③ 整理重复分组</span>
+    <span class="{{ 'done' if idx >= 3 }}">✓ 完成</span>
+  </div>
+  <div id="progress" class="progress {{ 'indeterminate' if not baseline else '' }}">
+    <div id="progress-bar" style="width:0%"></div>
+  </div>
+  <p class="muted small" id="progress-text">
+    {% if baseline %}已处理约 {{ ((current.stats.files_indexed or 0) / baseline * 100) | round(0) | int }}%（参考上次扫描的 {{ baseline }} 个文件）{% else %}首次扫描，暂时无法估算总进度；下方数字会实时更新。{% endif %}
+  </p>
+  <dl class="kv">
+    <div><dt>已扫描文件</dt><dd id="live-files">{{ current.stats.files_indexed or 0 }}</dd></div>
+    <div><dt>已扫描目录</dt><dd id="live-dirs">{{ current.dirs_seen or 0 }}</dd></div>
+    <div><dt>已计算哈希</dt><dd id="live-hashes">{{ current.stats.hashes_computed or 0 }}</dd></div>
+    <div><dt>当前阶段</dt><dd id="live-phase">{{ phase_text.get(current.phase, current.phase) }}</dd></div>
+  </dl>
+  <div class="row">
+    {% if current.status == 'running' %}
+    <button onclick="ctrl({{ current.id }},'pause')">暂停</button>
+    {% elif current.status == 'paused' %}
+    <button class="primary" onclick="ctrl({{ current.id }},'resume')">继续</button>
+    {% endif %}
+    <button class="danger" onclick="ctrl({{ current.id }},'cancel')">取消扫描</button>
+    <span class="muted small">扫描很慢也没关系，可以随时暂停，不会影响文件。</span>
+  </div>
+</div>
+{% endif %}
+
+<h2>历史任务</h2>
+{% if runs %}
+<div class="table-wrap">
 <table>
 <thead><tr><th>#</th><th>状态</th><th>阶段</th><th>开始</th><th>结束</th><th>文件</th><th>目录</th><th>哈希</th><th>操作</th></tr></thead>
 <tbody>
 {% for r in runs %}
 <tr>
   <td>{{ r.id }}</td>
-  <td><span class="pill {{ r.status }}">{{ r.status }}</span>{% if r.incomplete_reason %}<br><span class="warn small">{{ r.incomplete_reason }}</span>{% endif %}</td>
-  <td>{{ r.phase }}</td>
+  <td>
+    <span class="pill {{ r.status }}">{{ r.status_text }}</span>
+    {% if r.incomplete_reason %}<div class="warn small">{{ r.incomplete_reason }}</div>{% endif %}
+    {% if r.error %}<div class="error small">{{ r.error }}</div>{% endif %}
+  </td>
+  <td>{{ r.phase_text }}</td>
   <td class="small">{{ r.started_at }}</td>
-  <td class="small">{{ r.finished_at or '' }}</td>
+  <td class="small">{{ r.finished_at or '—' }}</td>
   <td>{{ r.stats.files_indexed or 0 }}</td>
   <td>{{ r.dirs_seen or 0 }}</td>
   <td>{{ r.stats.hashes_computed or 0 }}</td>
@@ -21,21 +67,58 @@
     <button class="danger" onclick="ctrl({{ r.id }},'cancel')">取消</button>{% endif %}
     {% if r.status == 'paused' %}<button class="primary" onclick="ctrl({{ r.id }},'resume')">继续</button>
     <button class="danger" onclick="ctrl({{ r.id }},'cancel')">取消</button>{% endif %}
-    {% if r.error %}<span class="warn small">{{ r.error }}</span>{% endif %}
   </td>
 </tr>
-{% else %}
-<tr><td colspan="9" class="muted">暂无任务</td></tr>
 {% endfor %}
 </tbody></table>
+</div>
+{% else %}
+<div class="card empty">
+  <h2>还没有扫描任务</h2>
+  <p>先创建扫描方案，再在方案上点「立即扫描」。</p>
+  <a class="button primary" href="/plans">去创建扫描方案</a>
+</div>
+{% endif %}
 {% endblock %}
 {% block scripts %}
 <script>
 async function ctrl(id, action) {
+  const label = {pause: '暂停', resume: '继续', cancel: '取消'}[action] || action;
+  if (action === 'cancel' && !confirm('确定取消这次扫描？已扫描的数据会保留，不会影响文件。')) return;
   const r = await api('POST', '/api/v1/scans/' + id + '/' + action, {});
-  if (!r.ok) alert((r.data.error || {}).message || '操作失败');
+  if (!r.ok) alert((r.data.error || {}).message || (label + '失败'));
   location.reload();
 }
-setTimeout(() => { if (document.querySelector('.pill.running')) location.reload(); }, 5000);
+const card = document.getElementById('live-card');
+if (card) {
+  const baseline = Number(card.dataset.baseline || 0);
+  const bar = document.getElementById('progress-bar');
+  const box = document.getElementById('progress');
+  const fmt = n => Number(n || 0).toLocaleString('zh-CN');
+  async function tick() {
+    const r = await api('GET', '/api/v1/scans/current');
+    const cur = r.ok ? r.data.current : null;
+    if (!cur || cur.status !== 'running') { location.reload(); return; }
+    const stats = cur.stats || {};
+    document.getElementById('live-files').textContent = fmt(stats.files_indexed);
+    document.getElementById('live-dirs').textContent = fmt(cur.dirs_seen);
+    document.getElementById('live-hashes').textContent = fmt(stats.hashes_computed);
+    const phaseNames = {walk: '扫描目录和文件', hash: '比对文件内容', group: '整理重复分组', done: '已完成'};
+    document.getElementById('live-phase').textContent = phaseNames[cur.phase] || cur.phase;
+    document.querySelectorAll('.phase-steps span').forEach((el, i) => {
+      el.className = i < ({walk:0, hash:1, group:2, done:3}[cur.phase] || 0) ? 'done' :
+                     (i === ({walk:0, hash:1, group:2, done:3}[cur.phase] || 0) ? 'active' : '');
+    });
+    if (baseline) {
+      const pct = Math.min(99, Math.round((stats.files_indexed || 0) / baseline * 100));
+      box.classList.remove('indeterminate');
+      bar.style.width = pct + '%';
+      document.getElementById('progress-text').textContent =
+        '已处理约 ' + pct + '%（参考上次扫描的 ' + fmt(baseline) + ' 个文件），完成后会自动刷新。';
+    }
+    setTimeout(tick, 3000);
+  }
+  setTimeout(tick, 3000);
+}
 </script>
 {% endblock %}

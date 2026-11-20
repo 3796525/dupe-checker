@@ -1,25 +1,69 @@
 {% extends "base.html" %}
-{% block title %}删除方案 #{{ plan.id }} · 重复文件核查器{% endblock %}
+{% block title %}删除清单 #{{ plan.id }} · 重复文件核查器{% endblock %}
 {% block content %}
-<h1>删除方案 #{{ plan.id }} <span class="pill">{{ plan.status }}</span></h1>
-<p class="muted">生成时间 {{ plan.created_at }} · 条目 {{ plan.total_items }} · 可释放 {{ (plan.releasable_bytes / 1048576) | round(1) }} MB</p>
-<div class="notice">请在 NAS 上按下列路径手工核对并删除。标记为 changed / missing 的条目请先重新扫描再处理。</div>
-<div class="row">
-  <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=csv">下载 CSV</a>
-  <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=html">下载 HTML 报告</a>
-  <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=json">下载 JSON</a>
+<p class="small"><a href="/delete-plans">← 返回删除清单</a></p>
+<h1>删除清单 #{{ plan.id }}
+  <span class="pill {{ plan.status }}">{{ '可导出' if plan.status == 'final' else '需复核' }}</span>
+</h1>
+<p class="muted small">生成时间 {{ plan.created_at }} · 条目 {{ plan.total_items }} · 可释放 {{ plan.releasable_bytes | bytes }}</p>
+
+{% if plan.status == 'final' %}
+<div class="notice ok">
+  所有条目都通过了生成时的复核。请在 NAS 上按路径人工删除；删除前确认「保留的文件」仍然存在。
 </div>
+{% else %}
+<div class="notice warn">
+  <strong>这份清单不能导出。</strong>生成时有 {{ plan.counts.get('changed', 0) }} 个文件已被修改、{{ plan.counts.get('missing', 0) }} 个文件已不存在，需要重新扫描并审核后才能生成可用清单。
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>导出与使用</h2>
+  <p class="muted small">
+    CSV 适合在表格软件里逐行核对；HTML 适合在浏览器里看；JSON 便于留档或二次处理。
+    导出内容包含文件路径、大小、修改时间、SHA-256 和对应的保留文件，<strong>不包含</strong>任何可执行的删除命令。
+  </p>
+  {% if plan.status == 'final' %}
+  <div class="row">
+    <a class="button primary" href="/api/v1/delete-plans/{{ plan.id }}/export?format=csv">下载 CSV</a>
+    <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=html">下载 HTML 报告</a>
+    <a class="button" href="/api/v1/delete-plans/{{ plan.id }}/export?format=json">下载 JSON</a>
+  </div>
+  <p class="muted small">建议：先导出，再逐条核对，确认保留文件还在，最后才在 NAS 上手工删除。删除后可以重新扫描确认可释放空间。</p>
+  {% else %}
+  <p class="muted">需复核的清单暂不可导出。请到「扫描任务」重新扫描，然后重新审核相关分组。</p>
+  <a class="button" href="/scans">去重新扫描</a>
+  {% endif %}
+</div>
+
+<h2>待删除文件</h2>
+{% if plan.items %}
+<div class="table-wrap">
 <table>
-<thead><tr><th>待删除路径</th><th>大小</th><th>修改时间</th><th>复核</th><th>保留的文件</th></tr></thead>
+<thead><tr><th>文件名</th><th>路径</th><th>大小</th><th>类型</th><th>修改时间</th><th>复核状态</th><th>保留的文件</th></tr></thead>
 <tbody>
-{% for i in plan.items %}
-<tr class="{{ i.recheck_status }}">
+{% for i in plan['items'] %}
+<tr>
+  <td>{{ i.path | basename }}</td>
   <td class="mono small">{{ i.path }}</td>
-  <td>{{ (i.size / 1024) | round(1) }} KB</td>
+  <td>{{ i.size | bytes }}</td>
+  <td>
+    {% if i.kind == 'content' %}<span class="type-badge content">内容重复</span>
+    {% elif i.kind == 'name' %}<span class="type-badge name">同名候选</span>
+    {% else %}<span class="muted">—</span>{% endif %}
+  </td>
   <td class="small">{{ i.mtime_ns | ts }}</td>
-  <td><span class="pill {{ i.recheck_status }}">{{ i.recheck_status }}</span></td>
-  <td class="mono small">{{ i.keep_path }}</td>
+  <td>
+    <span class="pill {{ i.recheck_status }}">
+      {{ {'consistent':'未变化','changed':'已修改','missing':'已不存在','unreadable':'不可读'}.get(i.recheck_status, i.recheck_status) }}
+    </span>
+  </td>
+  <td class="mono small">{{ i.keep_path or '—' }}</td>
 </tr>
 {% endfor %}
 </tbody></table>
+</div>
+{% else %}
+<div class="card empty"><p>这份清单没有条目。</p></div>
+{% endif %}
 {% endblock %}
