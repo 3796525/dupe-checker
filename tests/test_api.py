@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app import guard as guard_mod
 from app.config import config
+from app.db import now_iso
 from app.exporter import ExportError
 from app.guard import GuardReport, RootCheck
 from app.scanner import Scanner
@@ -356,6 +357,71 @@ def test_full_read_only_workflow(client, web, db, root):
     paths = {r.path for r in web.app.routes}
     assert not any("delete" in p and "delete-plans" not in p for p in paths), paths
     assert not any(p.endswith("/files/{path}") or "/move" in p or "/rename" in p for p in paths)
+
+# ---------------------------------------------------------------------------
+# UAT 2026-11-20: pausing a scan that had just finished froze the progress bar
+# forever (status stayed "running" with no worker thread)
+# ---------------------------------------------------------------------------
+def _insert_run(db, status: str, finished_at: str | None, phase: str = "done") -> int:
+    db.execute(
+        "INSERT INTO scan_runs(plan_id, status, phase, started_at, finished_at, stats_json) "
+        "VALUES (NULL, ?, ?, ?, ?, '{}')",
+        (status, phase, now_iso(), finished_at),
+    )
+    db.commit()
+    return int(db.query_one("SELECT id FROM scan_runs ORDER BY id DESC LIMIT 1")["id"])
+
+
+def test_finished_run_rejects_pause_resume_cancel(client, db):
+    csrf = login(client)
+    headers = {CSRF_HEADER: csrf}
+    run_id = _insert_run(db, "completed", now_iso())
+    for action in ("pause", "resume", "cancel"):
+        resp = client.post(f"/api/v1/scans/{run_id}/{action}", headers=headers)
+        assert resp.status_code == 409, (action, resp.text)
+        assert resp.json()["error"]["code"] == "SCAN_FINISHED"
+    row = db.query_one("SELECT * FROM scan_runs WHERE id=?", (run_id,))
+    assert row["status"] == "completed", "a late click must never revive a finished run"
+
+
+def test_reconcile_completes_stuck_finished_run(db):
+    # Real shape of run #4 on the NAS: the work finished and finished_at was
+    # recorded, but a pause/resume race left status="running".
+    run_id = _insert_run(db, "running", "2026-11-20T23:08:38+0800")
+    engine = Scanner(db)
+    assert engine.reconcile_orphans() == 1
+    row = db.query_one("SELECT * FROM scan_runs WHERE id=?", (run_id,))
+    assert row["status"] == "completed"
+    assert row["phase"] == "done"
+    assert row["finished_at"] == "2026-11-20T23:08:38+0800"
+    assert engine.reconcile_orphans() == 0, "reconciling twice must be a no-op"
+
+
+def test_reconcile_cancels_orphan_paused_run(db):
+    run_id = _insert_run(db, "paused", None, phase="walk")
+    engine = Scanner(db)
+    assert engine.reconcile_orphans() == 1
+    row = db.query_one("SELECT * FROM scan_runs WHERE id=?", (run_id,))
+    assert row["status"] == "cancelled"
+    assert "重启" in (row["incomplete_reason"] or "")
+    assert row["finished_at"]
+
+
+def test_start_reconciles_orphans_before_new_scan(db, root):
+    add_root(db, root)
+    build_tree(root)
+    stale = _insert_run(db, "running", None, phase="hash")
+    engine = Scanner(db)
+    try:
+        new_id = engine.start(None)
+        engine._thread.join(60)
+    finally:
+        engine._thread = None
+    old = db.query_one("SELECT * FROM scan_runs WHERE id=?", (stale,))
+    assert old["status"] == "cancelled"
+    new = db.query_one("SELECT * FROM scan_runs WHERE id=?", (new_id,))
+    assert new["status"] == "completed"
+
 
 
 def test_tree_endpoint_rejects_unknown_root(client):

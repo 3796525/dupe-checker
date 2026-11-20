@@ -261,6 +261,9 @@ def on_startup() -> None:
     _bootstrap_roots()
     db.set_setting("guard_report", json.dumps(guard_report.to_dict(), ensure_ascii=False))
     db.audit("system", "startup", "guard passed")
+    # Pause/resume/restart left "running" rows with no worker thread; repair
+    # them before any page is served so the UI never shows a frozen scan.
+    scan_engine.reconcile_orphans()
     # Periodic read-only recheck (P1-05): a mount remounted writable at
     # runtime flips the global guard state and protected routes answer 409.
     guard_mod.start_periodic(db)
@@ -620,17 +623,51 @@ def api_scan_detail(run_id: int, request: Request) -> dict:
 
 @app.post("/api/v1/scans/{run_id}/{action}")
 def api_scan_control(run_id: int, action: str, request: Request) -> dict:
+    """Pause / resume / cancel a scan with a guarded state transition.
+
+    UAT 2026-11-20: clicking 暂停 on a scan that had just finished flipped the
+    row to paused, then 继续 flipped it to running — with no worker thread left,
+    so the progress bar stayed frozen forever. Terminal runs are now rejected
+    and every transition is a conditional UPDATE (id + expected status +
+    finished_at IS NULL), so a late click can never resurrect a dead run.
+    """
     _require_api(request)
-    mapping = {"pause": "paused", "resume": "running", "cancel": "cancelled"}
+    # action -> (new status, allowed current statuses)
+    mapping = {
+        "pause": ("paused", ("running",)),
+        "resume": ("running", ("paused",)),
+        "cancel": ("cancelled", ("running", "paused")),
+    }
+    labels = {"pause": "暂停", "resume": "继续", "cancel": "取消"}
     if action not in mapping:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "未知操作"})
     row = db.query_one("SELECT * FROM scan_runs WHERE id=?", (run_id,))
     if row is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "任务不存在"})
-    db.execute("UPDATE scan_runs SET status=? WHERE id=?", (mapping[action], run_id))
+    target, allowed = mapping[action]
+    if row["status"] in ("completed", "cancelled", "failed") or row["finished_at"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "SCAN_FINISHED", "message": "该任务已经结束，不需要再操作；要重新检查请新建一次扫描"},
+        )
+    if row["status"] not in allowed:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "SCAN_STATE", "message": f"当前状态不能执行「{labels[action]}」，请刷新页面"},
+        )
+    marks = ",".join("?" for _ in allowed)
+    cur = db.execute(
+        f"UPDATE scan_runs SET status=? WHERE id=? AND status IN ({marks}) AND finished_at IS NULL",
+        (target, run_id, *allowed),
+    )
     db.commit()
+    if (cur.rowcount or 0) == 0:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "SCAN_STATE", "message": "任务状态刚刚发生变化，请刷新页面再试"},
+        )
     db.audit("user", f"scan.{action}", f"run={run_id}")
-    return {"id": run_id, "status": mapping[action]}
+    return {"id": run_id, "status": target}
 
 
 # ---------------------------------------------------------------------------

@@ -65,10 +65,49 @@ class Scanner:
     def current_run_id(self) -> int | None:
         return self._run_id if self.is_running() else None
 
+    def reconcile_orphans(self) -> int:
+        """Repair scan runs whose worker thread no longer exists.
+
+        Safe to call at startup and before starting a new scan; it never
+        touches a run while this process's scan thread is alive. Returns the
+        number of repaired rows.
+
+        - phase/finished already recorded => the work really finished, mark
+          completed (this is the pause/resume race that produced a stuck row).
+        - otherwise => the process died mid-run, mark cancelled so the UI can
+          offer a fresh scan instead of showing a frozen progress bar.
+        """
+        if self.is_running():
+            return 0
+        ts = now_iso()
+        cur = self.db.execute(
+            "UPDATE scan_runs SET status='completed', phase='done', "
+            "finished_at=COALESCE(finished_at, ?) "
+            "WHERE status IN ('running','paused') AND finished_at IS NOT NULL",
+            (ts,),
+        )
+        repaired = cur.rowcount or 0
+        cur = self.db.execute(
+            "UPDATE scan_runs SET status='cancelled', finished_at=?, "
+            "incomplete_reason=COALESCE(incomplete_reason, ?) "
+            "WHERE status IN ('running','paused')",
+            (ts, "服务重启导致扫描中断，请重新扫描"),
+        )
+        repaired += cur.rowcount or 0
+        self.db.commit()
+        if repaired:
+            log.warning("reconciled %s orphan scan run(s)", repaired)
+        return repaired
+
     def start(self, plan_id: int | None) -> int:
         with self._lock:
             if self.is_running():
                 raise RuntimeError("SCAN_RUNNING")
+            # A run row left in running/paused state without a live thread
+            # (container restart, crash) would otherwise block `/scans/current`
+            # forever and make the UI look stuck (UAT 2026-11-20: pause at the
+            # moment a scan finished left the run "running" with no thread).
+            self.reconcile_orphans()
             plan = None
             if plan_id is not None:
                 plan = self.db.query_one("SELECT * FROM scan_plans WHERE id=?", (plan_id,))

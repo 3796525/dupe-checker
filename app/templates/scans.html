@@ -98,7 +98,11 @@ if (card) {
   async function tick() {
     const r = await api('GET', '/api/v1/scans/current');
     const cur = r.ok ? r.data.current : null;
-    if (!cur || cur.status !== 'running') { location.reload(); return; }
+    if (!cur) { location.reload(); return; }
+    // Paused: keep the page still (the 继续 button is already rendered) instead
+    // of reloading every 3s. Finished/cancelled: reload once to show the result.
+    if (cur.status === 'paused') return;
+    if (cur.status !== 'running') { location.reload(); return; }
     const stats = cur.stats || {};
     document.getElementById('live-files').textContent = fmt(stats.files_indexed);
     document.getElementById('live-dirs').textContent = fmt(cur.dirs_seen);
