@@ -1,0 +1,52 @@
+# dupe-checker - read-only duplicate-file review tool
+#
+# Safety model, please read before changing anything:
+#   1. Scan roots are mounted READ-ONLY (:ro). The app re-probes writability at
+#      startup and refuses to run if a root turns out to be writable.
+#   2. Scan roots are mounted at their ORIGINAL path, so every path shown in the
+#      UI and in exports is the real path you can act on by hand.
+#   3. The only writable location is ./data (index + exports). Root filesystem
+#      is read-only and all Linux capabilities are dropped.
+#   4. This app never deletes, moves or renames anything. It only records
+#      review decisions and writes an export file. Deletion is always manual.
+#
+# Configure via .env (see .env.example).
+
+services:
+  dupe-checker:
+    build:
+      context: .
+    image: ${DUPE_IMAGE:-dupe-checker:latest}
+    container_name: ${DUPE_CONTAINER_NAME:-dupe-checker}
+    restart: unless-stopped
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:${HOST_PORT:-8080}:8080"
+    environment:
+      DATA_DIR: /data
+      DB_PATH: /data/db/dupe.db
+      EXPORT_DIR: /data/exports
+      LOG_DIR: /data/logs
+      PORT: "8080"
+      TZ: ${TZ:-Asia/Shanghai}
+      MOUNT_ROOTS: ${SCAN_ROOT:?set SCAN_ROOT in .env to the directory you want scanned}
+    volumes:
+      - ./data:/data
+      - "${SCAN_ROOT:?set SCAN_ROOT in .env}:${SCAN_ROOT:?set SCAN_ROOT in .env}:ro"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

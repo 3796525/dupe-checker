@@ -1,0 +1,17 @@
+# Optional override: scan several read-only roots at once.
+#
+# Mount every root at its original absolute path and list them in MOUNT_ROOTS
+# (comma separated). Each mount MUST keep the ":ro" suffix.
+#
+#   docker compose -f docker-compose.yml -f compose.multiroot.example.yaml up -d
+#
+# Adjust the paths below to the folders your restricted NAS account may read.
+
+services:
+  dupe-checker:
+    environment:
+      MOUNT_ROOTS: /vol1/1000/其他,/vol1/1000/我的图库,/vol1/1000/我的游戏
+    volumes:
+      - "/vol1/1000/其他:/vol1/1000/其他:ro"
+      - "/vol1/1000/我的图库:/vol1/1000/我的图库:ro"
+      - "/vol1/1000/我的游戏:/vol1/1000/我的游戏:ro"
