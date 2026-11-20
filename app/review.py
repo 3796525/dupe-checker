@@ -211,34 +211,45 @@ def save_decisions(db: Database, group_id: int, policy: str | None, decisions: l
     g = db.query_one("SELECT * FROM review_groups WHERE id=?", (group_id,))
     if g is None:
         raise ReviewError("NOT_FOUND", "分组不存在")
-    if policy:
-        db.execute("UPDATE review_groups SET policy=? WHERE id=?", (policy, group_id))
     valid = {"keep", "delete", "skip"}
-    for d in decisions:
-        decision = d.get("decision")
-        if decision not in valid:
-            raise ReviewError("VALIDATION_ERROR", f"非法决策: {decision}")
+    # Everything below is one transaction: a rejected submission must leave the
+    # group exactly as it was, so the "at least one keep per group" invariant
+    # can never be persisted by a later request (review P0-01).
+    try:
+        if policy:
+            db.execute("UPDATE review_groups SET policy=? WHERE id=?", (policy, group_id))
+        for d in decisions:
+            decision = d.get("decision")
+            if decision not in valid:
+                raise ReviewError("VALIDATION_ERROR", f"非法决策: {decision}")
+            db.execute(
+                "UPDATE review_items SET decision=? WHERE group_id=? AND id=?",
+                (decision, group_id, d.get("item_id")),
+            )
+        items = db.query("SELECT decision FROM review_items WHERE group_id=?", (group_id,))
+        keeps = sum(1 for i in items if i["decision"] == "keep")
+        deletes = sum(1 for i in items if i["decision"] == "delete")
+        all_decided = all(i["decision"] in ("keep", "delete") for i in items)
+        if deletes > 0 and keeps == 0:
+            raise ReviewError(
+                "GROUP_KEEP_VIOLATION",
+                "每组至少保留 1 份，请先取消一个删除项",
+                {"group_id": group_id},
+            )
+        if not all_decided:
+            status = "pending"
+        elif deletes == 0:
+            status = "skipped"
+        else:
+            status = "reviewed"
         db.execute(
-            "UPDATE review_items SET decision=? WHERE group_id=? AND id=?",
-            (decision, group_id, d.get("item_id")),
+            "UPDATE review_groups SET status=?, updated_at=? WHERE id=?",
+            (status, now_iso(), group_id),
         )
-    items = db.query("SELECT decision FROM review_items WHERE group_id=?", (group_id,))
-    keeps = sum(1 for i in items if i["decision"] == "keep")
-    deletes = sum(1 for i in items if i["decision"] == "delete")
-    if deletes > 0 and keeps == 0:
         db.commit()
-        raise ReviewError(
-            "GROUP_KEEP_VIOLATION", "每组至少保留 1 份，请先取消一个删除项", {"group_id": group_id}
-        )
-    all_decided = all(i["decision"] in ("keep", "delete") for i in items)
-    status = "reviewed" if all_decided and deletes > 0 else (g["status"] if deletes == 0 else "pending")
-    if deletes == 0 and all_decided:
-        status = "skipped"
-    db.execute(
-        "UPDATE review_groups SET status=?, updated_at=? WHERE id=?",
-        (status, now_iso(), group_id),
-    )
-    db.commit()
+    except ReviewError:
+        db.rollback()
+        raise
     db.audit("user", "review.save", f"group={group_id} keep={keeps} delete={deletes}")
     return {"id": group_id, "status": status, "keeps": keeps, "deletes": deletes}
 

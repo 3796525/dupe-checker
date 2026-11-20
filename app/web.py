@@ -26,7 +26,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import exporter, plans, review, scanner as scanner_mod
+from . import exporter, guard as guard_mod, plans, review, scanner as scanner_mod
 from .config import config
 from .db import get_db, now_iso
 from .guard import GuardReport, enforce_guard_or_exit
@@ -35,8 +35,13 @@ from .security import (
     SESSION_COOKIE,
     LoginRateLimiter,
     SessionManager,
+    clear_setup_token,
     csrf_ok,
+    ensure_setup_token,
     hash_password,
+    load_setup_token,
+    setup_token_ok,
+    setup_token_path,
     verify_password,
 )
 
@@ -62,6 +67,8 @@ templates.env.filters["ts"] = _ts_filter
 db = get_db()
 sessions = SessionManager(db)
 limiter = LoginRateLimiter()
+# Separate limiter: /setup is unauthenticated, so it needs its own counter.
+setup_limiter = LoginRateLimiter()
 scan_engine = scanner_mod.Scanner(db)
 guard_report: GuardReport = GuardReport()
 
@@ -128,6 +135,79 @@ def _json_error(code: str, message: str, status: int, details: dict | None = Non
     )
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _cookie_secure(request: Request) -> bool:
+    """SESSION_COOKIE_SECURE=auto/always/never (P1-04)."""
+    mode = config.session_cookie_secure
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    forwarded = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if forwarded == "https":
+        return True
+    return request.url.scheme == "https"
+
+
+def _set_session_cookie(resp: Response, token: str, request: Request) -> None:
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(request),
+        max_age=config.session_ttl_seconds,
+    )
+
+
+def _guard_snapshot() -> dict:
+    """Live guard state (falls back to the startup snapshot in tests)."""
+    report = guard_mod.current_report()
+    data = report.to_dict() if report.roots else guard_report.to_dict()
+    data["unsafe"] = guard_mod.is_unsafe()
+    data["unsafe_reason"] = guard_mod.unsafe_reason()
+    data["verified_at"] = data.get("verified_at") or guard_mod.current_verified_at() or ""
+    return data
+
+
+def _guard_unsafe_response() -> JSONResponse | None:
+    """409 for mutating/exporting routes while the read-only self check fails."""
+    if not guard_mod.is_unsafe():
+        return None
+    reason = guard_mod.unsafe_reason() or "只读自检未通过"
+    return _json_error(
+        "GUARD_UNSAFE",
+        f"只读自检未通过，为保护数据已暂停该操作：{reason}",
+        409,
+    )
+
+
+def _init_setup_token() -> None:
+    """First run: create the one-time /setup token and announce it on stdout."""
+    if _is_setup():
+        clear_setup_token()
+        return
+    try:
+        token = ensure_setup_token()
+    except OSError as exc:  # pg: DATA_DIR unwritable
+        log.error("首次启动无法生成初始化令牌（/setup 将不可用）: %s", exc)
+        return
+    banner = (
+        "\n" + "=" * 76 + "\n"
+        "  首次启动：初始化令牌（setup token）\n"
+        f"  {token}\n"
+        "  打开 /setup 并填入该令牌以设置管理员口令。\n"
+        "  请先查看容器日志获取初始化令牌（docker compose logs）。\n"
+        "  令牌仅保存在本机数据卷 setup_token 文件中（权限 0600），设置成功后自动删除。\n"
+        + "=" * 76 + "\n"
+    )
+    print(banner, flush=True)
+    log.warning("初始化令牌已写入 %s（0600），设置口令成功后自动删除", setup_token_path())
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     detail = exc.detail if isinstance(exc.detail, dict) else {"code": "ERROR", "message": str(exc.detail)}
@@ -154,9 +234,13 @@ def on_startup() -> None:
     config.ensure_dirs()
     logging.basicConfig(level=logging.INFO)
     guard_report = enforce_guard_or_exit()
+    _init_setup_token()
     _bootstrap_roots()
     db.set_setting("guard_report", json.dumps(guard_report.to_dict(), ensure_ascii=False))
     db.audit("system", "startup", "guard passed")
+    # Periodic read-only recheck (P1-05): a mount remounted writable at
+    # runtime flips the global guard state and protected routes answer 409.
+    guard_mod.start_periodic(db)
     from .scheduler import Scheduler
 
     Scheduler(db, scan_engine).start()
@@ -167,10 +251,11 @@ def on_startup() -> None:
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> JSONResponse:
+    guard = _guard_snapshot()
     return JSONResponse(
         {
-            "status": "ok" if guard_report.passed else "fatal",
-            "guard": guard_report.to_dict(),
+            "status": "ok" if guard.get("passed") and not guard.get("unsafe") else "fatal",
+            "guard": guard,
             "version": config.version,
         }
     )
@@ -178,10 +263,11 @@ def health() -> JSONResponse:
 
 @app.get("/api/v1/system/health")
 def api_health() -> JSONResponse:
+    guard = _guard_snapshot()
     return JSONResponse(
         {
-            "status": "ok" if guard_report.passed else "fatal",
-            "guard": guard_report.to_dict(),
+            "status": "ok" if guard.get("passed") and not guard.get("unsafe") else "fatal",
+            "guard": guard,
             "db": {"ok": True, "schema_version": 1},
             "version": config.version,
         }
@@ -196,31 +282,69 @@ def api_version() -> dict:
 @app.get("/api/v1/system/guard")
 def api_guard(request: Request) -> dict:
     _require_api(request)
-    return json.loads(db.get_setting("guard_report", "{}") or "{}")
+    data = _guard_snapshot()
+    if data.get("roots"):
+        return data
+    return json.loads(db.get_setting("guard_report", "{}") or "{}") or data
 
 
 # ---------------------------------------------------------------------------
 # auth
 # ---------------------------------------------------------------------------
+def _setup_token_page(request: Request, error: str = "") -> HTMLResponse:
+    return templates.TemplateResponse(
+        request=request,
+        name="setup_token.html",
+        context={
+            "request": request,
+            "version": config.version,
+            "nav": "setup",
+            "error": error,
+        },
+        status_code=403,
+    )
+
+
 @app.get("/setup", response_class=HTMLResponse)
-def setup_page(request: Request):
+def setup_page(request: Request, token: str = ""):
     if _is_setup():
         return RedirectResponse("/login", status_code=303)
-    return _page(request, "setup.html")
+    expected = load_setup_token()
+    if not setup_token_ok(expected, token):
+        # No valid token: never render the password form. 403 without leaking
+        # whether a token exists at all.
+        return _setup_token_page(request)
+    return _page(request, "setup.html", setup_token=token)
 
 
 @app.post("/api/v1/auth/setup")
 async def api_setup(request: Request):
     if _is_setup():
         return _json_error("FORBIDDEN", "已初始化", 403)
-    body = await request.json()
+    client = _client_ip(request)
+    if setup_limiter.is_blocked(client):
+        return _json_error("RATE_LIMITED", "初始化尝试过于频繁，请 60 秒后再试", 429)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    provided = str(body.get("token", ""))
+    if not setup_token_ok(load_setup_token(), provided):
+        setup_limiter.record_failure(client)
+        db.audit("user", "auth.setup_failed", client)
+        # Deliberately vague: do not reveal whether a token exists/expired.
+        return _json_error("SETUP_FORBIDDEN", "初始化令牌无效或已失效", 403)
     password = str(body.get("password", ""))
     if len(password) < 10:
         return _json_error("VALIDATION_ERROR", "口令至少 10 位", 400)
+    setup_limiter.reset(client)
     db.set_setting("password_hash", hash_password(password))
+    clear_setup_token()
     token, csrf = sessions.create()
     resp = JSONResponse({"ok": True, "csrf_token": csrf})
-    resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=config.session_max_age)
+    _set_session_cookie(resp, token, request)
     db.audit("user", "auth.setup", "")
     return resp
 
@@ -246,15 +370,25 @@ async def api_login(request: Request):
     limiter.reset(client)
     token, csrf = sessions.create()
     resp = JSONResponse({"ok": True, "csrf_token": csrf})
-    resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=config.session_max_age)
+    _set_session_cookie(resp, token, request)
     db.audit("user", "auth.login", client)
     return resp
 
 
 @app.post("/api/v1/auth/logout")
 def api_logout(request: Request):
+    sess = _session(request)
+    if sess is not None:
+        if not csrf_ok(sess.get("csrf"), request.headers.get(CSRF_HEADER)):
+            raise HTTPException(status_code=403, detail={"code": "FORBIDDEN", "message": "CSRF 校验失败"})
+        # Server-side revocation (P1-04): bump the epoch so every issued
+        # cookie is invalid even if the browser keeps it.
+        sessions.revoke_all()
+        db.audit("user", "auth.logout", "")
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(SESSION_COOKIE)
+    resp.delete_cookie(
+        SESSION_COOKIE, path="/", secure=_cookie_secure(request), httponly=True, samesite="lax"
+    )
     return resp
 
 
@@ -402,6 +536,9 @@ def api_plan_delete(plan_id: int, request: Request) -> dict:
 @app.post("/api/v1/scans")
 async def api_scan_start(request: Request) -> dict:
     _require_api(request)
+    blocked = _guard_unsafe_response()
+    if blocked is not None:
+        return blocked
     body = await request.json() if await request.body() else {}
     plan_id = body.get("plan_id") or None
     if plan_id is not None and db.query_one("SELECT id FROM scan_plans WHERE id=?", (plan_id,)) is None:
@@ -536,6 +673,9 @@ def api_review_stats(request: Request) -> dict:
 @app.post("/api/v1/delete-plans")
 async def api_plan_generate(request: Request) -> dict:
     _require_api(request)
+    blocked = _guard_unsafe_response()
+    if blocked is not None:
+        return blocked
     body = await request.json() if await request.body() else {}
     try:
         return plans.generate_plan(db, str(body.get("note") or ""))
@@ -561,10 +701,16 @@ def api_plan_detail(plan_id: int, request: Request) -> dict:
 @app.get("/api/v1/delete-plans/{plan_id}/export")
 def api_plan_export(plan_id: int, request: Request, format: str = "csv"):
     _require_api(request)
+    blocked = _guard_unsafe_response()
+    if blocked is not None:
+        return blocked
     try:
         filename, media_type, payload = exporter.build_export(db, plan_id, format)
     except exporter.ExportError as exc:
-        raise HTTPException(status_code=404 if exc.code == "NOT_FOUND" else 400,
+        # NOT_FOUND/validation keep their old meaning; every other refusal
+        # (e.g. plan still needs review) is a state conflict -> 409.
+        status = {"NOT_FOUND": 404, "VALIDATION_ERROR": 400}.get(exc.code, 409)
+        raise HTTPException(status_code=status,
                             detail={"code": exc.code, "message": exc.message})
     return Response(
         content=payload,
@@ -776,7 +922,7 @@ def settings_page(request: Request):
             "rate_meta": db.get_setting("rate_meta", "2000"),
             "rate_hash": db.get_setting("rate_hash", "50"),
         },
-        guard=guard_report.to_dict(),
+        guard=_guard_snapshot(),
     )
 
 

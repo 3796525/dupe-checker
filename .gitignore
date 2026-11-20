@@ -1,6 +1,7 @@
 # secrets
 .secrets/
 .env
+.env.nas
 *.key
 *.pem
 id_*

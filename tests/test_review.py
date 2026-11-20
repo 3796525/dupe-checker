@@ -127,3 +127,103 @@ def test_stats_track_pending_and_planned_bytes(db, root):
     st = review.stats(db)
     assert st["total_groups"] >= 1
     assert st["planned_delete_bytes"] >= len(PAYLOAD)
+
+
+# --- regression tests for review P0-01: keep invariant must be transactional ---
+
+def test_violating_submission_rolls_back_previous_state(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    g = _content_group(db)
+    detail = review.group_detail(db, g["id"])
+    keep, delete = detail["items"][0], detail["items"][1]
+    review.save_decisions(db, g["id"], None, [
+        {"item_id": keep["id"], "decision": "keep"},
+        {"item_id": delete["id"], "decision": "delete"},
+    ])
+    # Second request tries to delete the only kept copy of the group.
+    with pytest.raises(review.ReviewError) as err:
+        review.save_decisions(db, g["id"], None, [
+            {"item_id": keep["id"], "decision": "delete"},
+        ])
+    assert err.value.code == "GROUP_KEEP_VIOLATION"
+    decisions = {
+        row["id"]: row["decision"]
+        for row in db.query("SELECT id, decision FROM review_items WHERE group_id=?", (g["id"],))
+    }
+    assert decisions[keep["id"]] == "keep"
+    assert decisions[delete["id"]] == "delete"
+    row = db.query_one("SELECT status FROM review_groups WHERE id=?", (g["id"],))
+    assert row["status"] == "reviewed"
+    # ...and the plan still contains exactly one safe row.
+    plan = plans.generate_plan(db)
+    assert plan["total_items"] == 1
+    assert plan["violations"] == []
+    item = plans.plan_detail(db, plan["id"])["items"][0]
+    assert item["path"] == delete["path"]
+    assert item["keep_path"] == keep["path"]
+
+
+def test_plan_refuses_group_without_keep_even_if_db_tampered(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    g = _content_group(db)
+    detail = review.group_detail(db, g["id"])
+    keep, delete = detail["items"][0], detail["items"][1]
+    review.save_decisions(db, g["id"], None, [
+        {"item_id": keep["id"], "decision": "keep"},
+        {"item_id": delete["id"], "decision": "delete"},
+    ])
+    # Simulate a corrupted/legacy row set: group marked reviewed but no keep.
+    db.execute("UPDATE review_items SET decision='delete' WHERE group_id=?", (g["id"],))
+    db.commit()
+    with pytest.raises(plans.PlanError):
+        plans.generate_plan(db)
+    assert db.query_one("SELECT COUNT(*) AS n FROM delete_plans")["n"] == 0
+
+
+def test_plan_refuses_group_when_keep_copy_changed(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    g = _content_group(db)
+    detail = review.group_detail(db, g["id"])
+    keep, delete = detail["items"][0], detail["items"][1]
+    review.save_decisions(db, g["id"], None, [
+        {"item_id": keep["id"], "decision": "keep"},
+        {"item_id": delete["id"], "decision": "delete"},
+    ])
+    with open(keep["path"], "ab") as fh:
+        fh.write(b"keep-mutated")
+    with pytest.raises(plans.PlanError):
+        plans.generate_plan(db)
+
+
+def test_name_group_with_different_content_never_reaches_plan(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    g = _content_group(db)
+    detail = review.group_detail(db, g["id"])
+    keep, delete = detail["items"][0], detail["items"][1]
+    review.save_decisions(db, g["id"], None, [
+        {"item_id": keep["id"], "decision": "keep"},
+        {"item_id": delete["id"], "decision": "delete"},
+    ])
+    names = review.list_groups(db, kind="name", status=None)["items"]
+    target = next(n for n in names if n["key"] == "same_name.txt")
+    ndetail = review.group_detail(db, target["id"])
+    nkeep, ndelete = ndetail["items"][0], ndetail["items"][1]
+    review.save_decisions(db, target["id"], None, [
+        {"item_id": nkeep["id"], "decision": "keep"},
+        {"item_id": ndelete["id"], "decision": "delete"},
+    ])
+    plan = plans.generate_plan(db)
+    assert plan["status"] == "needs_review"
+    assert plan["total_items"] == 1  # only the verified content-group row
+    reasons = {v["reason"] for v in plan["violations"]}
+    assert "name_unverified" in reasons
+    assert all(v["group_id"] != g["id"] for v in plan["violations"])
+

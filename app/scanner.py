@@ -309,19 +309,35 @@ class Scanner:
         for row in sizes:
             self._wait_window(window)
             self._check_state(run_id)
+            # Every present member of the size bucket is a candidate, including
+            # files that already carry a cached sha256. Restricting the query to
+            # "sha256 IS NULL" used to hide the cached members, so a newly added
+            # duplicate was sampled alone (bucket of 1), skipped, and never
+            # joined its content group (review P1-02). Cached hashes stay valid
+            # because the metadata phase clears sha256 whenever the
+            # size/mtime/ctime fingerprint changes.
             members = db.query(
-                "SELECT dev, ino, size FROM files "
-                "WHERE size=? AND status='present' AND sha256 IS NULL", (row["size"],)
+                "SELECT dev, ino, size, sha256 FROM files WHERE size=? AND status='present'",
+                (row["size"],),
             )
+            unhashed = [m for m in members if not m["sha256"]]
+            if not unhashed:
+                continue
+            if any(m["sha256"] for m in members):
+                # Cached members give us something to compare against, so one
+                # full SHA-256 per new member settles duplicate membership
+                # directly (at most O(new files) full hashes per size bucket).
+                self._hash_members(run_id, unhashed, limiter, stats)
+                db.commit()
+                continue
+            # Nothing in this bucket has been hashed yet: keep the cheap
+            # two-stage path (head/tail sample first, full hash only for sample
+            # collisions).
             sample_groups: dict[str, list] = {}
-            for m in members:
-                paths = db.query(
-                    "SELECT path FROM file_paths WHERE dev=? AND ino=? LIMIT 1",
-                    (m["dev"], m["ino"]),
-                )
-                if not paths:
+            for m in unhashed:
+                path = self._first_path(m["dev"], m["ino"])
+                if path is None:
                     continue
-                path = paths[0]["path"]
                 try:
                     if m["size"] <= 2 * SAMPLE_BYTES:
                         digest, nbytes = _sha256_file(path, limiter)
@@ -360,6 +376,32 @@ class Scanner:
                     )
                 db.commit()
         db.commit()
+
+    def _first_path(self, dev: int, ino: int) -> str | None:
+        row = self.db.query_one(
+            "SELECT path FROM file_paths WHERE dev=? AND ino=? LIMIT 1", (dev, ino)
+        )
+        return row["path"] if row else None
+
+    def _hash_members(self, run_id, members, limiter, stats) -> None:
+        """Full-hash the given (dev, ino) rows and persist the result."""
+        for m in members:
+            self._check_state(run_id)
+            path = self._first_path(m["dev"], m["ino"])
+            if path is None:
+                continue
+            try:
+                full, nbytes = _sha256_file(path, limiter)
+            except OSError as exc:
+                _record_error(stats, f"{path}: {exc.strerror}")
+                continue
+            limiter.consume(nbytes)
+            stats["bytes_hashed"] += nbytes
+            stats["hashes_computed"] += 1
+            self.db.execute(
+                "UPDATE files SET sha256=?, hash_verified_at=? WHERE dev=? AND ino=?",
+                (full, now_iso(), m["dev"], m["ino"]),
+            )
 
     # ---- grouping --------------------------------------------------------
     def _rebuild_groups(self) -> dict:

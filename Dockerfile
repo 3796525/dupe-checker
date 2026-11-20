@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # dupe-checker: read-only duplicate-file review tool.
 # The container is deliberately minimal: no shell tooling needed at runtime,
 # non-root by default, and the only writable path is the /data volume.
@@ -16,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY main.py ./
+# Build contexts from Windows/SMB shares often lose the executable/read bits;
+# normalize so the non-root runtime user can always read the code.
+RUN chmod -R a+rX /app
 
 # Non-root runtime user. Compose may override it with user: APP_UID:APP_GID so
 # the container identity matches the NAS account that holds the read grant.

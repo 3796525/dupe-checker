@@ -159,7 +159,8 @@ CREATE TABLE IF NOT EXISTS plan_items (
     sha256 TEXT,
     keep_path TEXT,
     recheck_status TEXT NOT NULL DEFAULT 'pending',
-    group_id INTEGER
+    group_id INTEGER,
+    kind TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
@@ -202,6 +203,12 @@ class Database:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # -- lightweight migrations for existing databases --
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(plan_items)")}
+            if "kind" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE plan_items ADD COLUMN kind TEXT NOT NULL DEFAULT ''"
+                )
             cur = self._conn.execute("SELECT MAX(version) AS v FROM schema_version")
             row = cur.fetchone()
             if not row or row["v"] is None:
@@ -224,6 +231,10 @@ class Database:
     def commit(self) -> None:
         with self._lock:
             self._conn.commit()
+
+    def rollback(self) -> None:
+        with self._lock:
+            self._conn.rollback()
 
     def executescript(self, script: str) -> None:
         with self._lock:

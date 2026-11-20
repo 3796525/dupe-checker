@@ -9,8 +9,10 @@
   {% else %}
     <p class="warn">未通过！</p>
   {% endif %}
+  {% if guard.unsafe %}<p class="warn">只读自检失败：已暂停扫描与导出（{{ guard.unsafe_reason }}）。</p>{% endif %}
+  <p class="small muted">最近一次自检：{{ guard.verified_at or '未知' }}</p>
   <ul class="small muted">
-    {% for r in guard.roots %}<li>{{ r.path }} — 存在={{ r.exists }} 可读={{ r.readable }} 只读={{ r.readonly }} {{ r.error }}</li>{% endfor %}
+    {% for r in guard.roots %}<li>{{ r.path }} — 存在={{ r.exists }} 可读={{ r.readable }} 只读={{ r.readonly }} 嵌套检查={{ r.nested_checked }}{% if r.nested_writable %} 可写子目录={{ r.nested_writable }}{% endif %} {{ r.error }}</li>{% endfor %}
   </ul>
 </div>
 <div class="card">

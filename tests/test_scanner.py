@@ -164,3 +164,58 @@ def test_empty_files_are_not_grouped(db, root):
     empty_sha = hashlib.sha256(b"").hexdigest()
     row = db.query_one("SELECT * FROM content_groups WHERE sha256=?", (empty_sha,))
     assert row is None
+
+
+def test_new_duplicate_next_to_cached_hashes_joins_content_group(db, root):
+    """Regression for review P1-02: cached hashes must not hide a new duplicate."""
+    add_root(db, root)
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    (root / "a" / "dup.txt").write_bytes(PAYLOAD)
+    (root / "b" / "dup_copy.txt").write_bytes(PAYLOAD)
+    first = json.loads(run_scan(db)["stats_json"])
+    assert first["hashes_computed"] == 2
+
+    (root / "c").mkdir()
+    (root / "c" / "dup_third.txt").write_bytes(PAYLOAD)
+    second = run_scan(db)
+    stats = json.loads(second["stats_json"])
+    assert stats["hashes_computed"] >= 1, "the new duplicate must be fully hashed"
+
+    group = db.query_one("SELECT * FROM content_groups WHERE sha256=?", (PAYLOAD_SHA,))
+    assert group is not None
+    assert group["member_count"] == 3
+    assert group["wasted_bytes"] == 2 * len(PAYLOAD)
+    unhashed = db.query_one(
+        "SELECT COUNT(*) AS n FROM files WHERE status='present' AND sha256 IS NULL"
+    )
+    assert unhashed["n"] == 0
+
+
+def test_new_same_size_file_next_to_cached_hashes_is_not_grouped(db, root):
+    """A same-size newcomer must be compared, not assumed to be a duplicate."""
+    add_root(db, root)
+    (root / "a").mkdir()
+    (root / "b").mkdir()
+    (root / "a" / "dup.txt").write_bytes(PAYLOAD)
+    (root / "b" / "dup_copy.txt").write_bytes(PAYLOAD)
+    run_scan(db)
+
+    (root / "c").mkdir()
+    decoy = b"Z" * len(PAYLOAD)  # same size, different content
+    (root / "c" / "same_size.bin").write_bytes(decoy)
+    run_scan(db)
+
+    assert db.query_one(
+        "SELECT 1 FROM content_groups WHERE sha256=?", (hashlib.sha256(decoy).hexdigest(),)
+    ) is None
+    group = db.query_one("SELECT * FROM content_groups WHERE sha256=?", (PAYLOAD_SHA,))
+    assert group["member_count"] == 2
+    assert group["wasted_bytes"] == len(PAYLOAD)
+    row = db.query_one(
+        "SELECT f.sha256 FROM files f JOIN file_paths p ON p.dev=f.dev AND p.ino=f.ino "
+        "WHERE p.path=?",
+        (str(root / "c" / "same_size.bin"),),
+    )
+    assert row["sha256"] == hashlib.sha256(decoy).hexdigest()
+

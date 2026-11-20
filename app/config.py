@@ -23,9 +23,24 @@ class Config:
         # MOUNT_ROOTS: colon/comma separated read-only mount points
         raw = _env("MOUNT_ROOTS", "")
         self.mount_roots = [p for p in raw.replace(",", ":").split(":") if p.strip()]
-        self.session_max_age = int(_env("SESSION_MAX_AGE", str(7 * 24 * 3600)))
+        # Session lifetime (P1-04): 8h default instead of the old 7 days.
+        # SESSION_MAX_AGE is kept as a backwards-compatible alias.
+        legacy_max_age = _env("SESSION_MAX_AGE", "")
+        self.session_ttl_seconds = int(
+            _env("SESSION_TTL_SECONDS", legacy_max_age or str(8 * 3600))
+        )
+        # Kept for callers that still read the old name.
+        self.session_max_age = self.session_ttl_seconds
+        # auto / always / never (P1-04). "auto" adds Secure when the request is
+        # HTTPS (directly or through a TLS reverse proxy).
+        secure_mode = _env("SESSION_COOKIE_SECURE", "auto").lower()
+        self.session_cookie_secure = secure_mode if secure_mode in ("auto", "always", "never") else "auto"
         self.login_rate_limit = int(_env("LOGIN_RATE_LIMIT", "5"))
         self.login_rate_window = int(_env("LOGIN_RATE_WINDOW", "60"))
+        # Guard deep check (P1-05): per-root nested sampling + periodic recheck.
+        self.guard_interval_seconds = max(60, int(_env("GUARD_INTERVAL_SECONDS", "1800")))
+        self.guard_sample_limit = max(0, int(_env("GUARD_SAMPLE_LIMIT", "20")))
+        self.guard_max_depth = max(1, int(_env("GUARD_MAX_DEPTH", "3")))
         self.version = "0.1.0"
 
     def ensure_dirs(self) -> None:

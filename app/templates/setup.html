@@ -5,6 +5,7 @@
   <h1>首次设置</h1>
   <p class="muted">设置访问口令（至少 10 位）。此口令只保存在本机数据卷中。</p>
   <form id="setup-form">
+    <input type="hidden" name="setup_token" id="setup-token" value="{{ setup_token or '' }}">
     <label>口令 <input type="password" name="password" minlength="10" required autofocus></label>
     <label>再输一次 <input type="password" name="password2" minlength="10" required></label>
     <button type="submit" class="primary">创建并进入</button>
@@ -19,7 +20,10 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
   const f = e.target, err = document.getElementById('err');
   err.textContent = '';
   if (f.password.value !== f.password2.value) { err.textContent = '两次口令不一致'; return; }
-  const r = await api('POST', '/api/v1/auth/setup', {password: f.password.value});
+  const r = await api('POST', '/api/v1/auth/setup', {
+    password: f.password.value,
+    token: f.setup_token.value,
+  });
   if (r.ok) { location.href = '/'; } else { err.textContent = (r.data.error || {}).message || '设置失败'; }
 });
 </script>
