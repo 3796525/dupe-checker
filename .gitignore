@@ -1,0 +1,21 @@
+# secrets
+.secrets/
+.env
+*.key
+*.pem
+id_*
+
+# data / state
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# python / node
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+build/
