@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shutil
 import time
 
 from app import review
@@ -218,4 +219,41 @@ def test_new_same_size_file_next_to_cached_hashes_is_not_grouped(db, root):
         (str(root / "c" / "same_size.bin"),),
     )
     assert row["sha256"] == hashlib.sha256(decoy).hexdigest()
+
+
+def test_include_scoped_plan_does_not_expire_unrelated_files(db, root):
+    """A plan with include_globs must not mark files outside its scope missing."""
+    root_id = add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    plan_id = add_plan(db, root_id, include_globs="*.txt")
+    run = run_scan(db, plan_id)
+    stats = json.loads(run["stats_json"])
+    assert stats["files_indexed"] == 0
+    assert db.query("SELECT COUNT(*) AS n FROM file_paths")[0]["n"] == 5
+    assert db.query("SELECT COUNT(*) AS n FROM files WHERE status='present'")[0]["n"] == 5
+
+
+def test_exclude_scoped_plan_keeps_excluded_entries(db, root):
+    """Excluded paths are simply ignored; they must not be expired as missing."""
+    root_id = add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    plan_id = add_plan(db, root_id, exclude_globs="b/*")
+    run_scan(db, plan_id)
+    assert db.query("SELECT 1 FROM file_paths WHERE path=?", (str(root / "b" / "dup_copy.txt"),)) != []
+    assert db.query("SELECT COUNT(*) AS n FROM files WHERE status='present'")[0]["n"] == 5
+    group = db.query_one("SELECT * FROM content_groups WHERE sha256=?", (PAYLOAD_SHA,))
+    assert group is not None and group["member_count"] == 2
+
+
+def test_deleted_directory_still_marks_files_missing(db, root):
+    """When a directory really disappears, its entries are still expired."""
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    shutil.rmtree(root / "b")
+    run_scan(db)
+    assert db.query("SELECT 1 FROM file_paths WHERE path=?", (str(root / "b" / "dup_copy.txt"),)) == []
+    assert db.query("SELECT COUNT(*) AS n FROM files WHERE status='present'")[0]["n"] == 4
 

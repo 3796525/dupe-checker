@@ -199,8 +199,8 @@ class Scanner:
         meta_limiter = RateLimiter(rate_meta)
         hash_limiter = RateLimiter(rate_hash * 1024 * 1024)
 
-        self._walk_all(run_id, gen, roots, include, exclude, meta_limiter, window, stats)
-        self._finalize_walk(gen, roots, stats)
+        visited = self._walk_all(run_id, gen, roots, include, exclude, meta_limiter, window, stats)
+        self._finalize_walk(gen, roots, include, exclude, visited, stats)
         self._check_state(run_id)
         self._update_stats(run_id, stats, "hash", stats["dirs_scanned"])
 
@@ -231,10 +231,12 @@ class Scanner:
             roots = [r for r in roots if r["id"] in wanted]
         return list(roots)
 
-    def _walk_all(self, run_id, gen, roots, include, exclude, limiter, window, stats) -> None:
+    def _walk_all(self, run_id, gen, roots, include, exclude, limiter, window, stats) -> dict:
         batch = 0
+        visited: dict[int, set[str]] = {}
         for root in roots:
             base = root["mount_path"]
+            seen_dirs = visited.setdefault(int(root["id"]), set())
             stack = [base]
             while stack:
                 self._wait_window(window)
@@ -245,6 +247,7 @@ class Scanner:
                 except OSError as exc:
                     _record_error(stats, f"{dirpath}: {exc.strerror}")
                     continue
+                seen_dirs.add(dirpath)
                 stats["dirs_scanned"] += 1
                 for entry in entries:
                     try:
@@ -274,6 +277,7 @@ class Scanner:
                 self.db.commit()
                 self._update_stats(run_id, stats, "walk", stats["dirs_scanned"])
         self.db.commit()
+        return visited
 
     def _upsert_file(self, st, path: str, name: str, root_id: int, gen: int) -> None:
         db = self.db
@@ -314,10 +318,36 @@ class Scanner:
             (st.st_dev, st.st_ino, path, name, root_id, gen),
         )
 
-    def _finalize_walk(self, gen: int, roots, stats: dict) -> None:
+    def _finalize_walk(self, gen: int, roots, include, exclude, visited: dict, stats: dict) -> None:
         db = self.db
+        # Only entries this run could actually have seen are allowed to expire:
+        #  * the parent directory was visited, and the path matches this plan's
+        #    include/exclude filters, or
+        #  * the parent directory no longer exists (deleted on disk).
+        # A scoped plan (include/exclude globs, or a plan that selects one
+        # subdirectory) must never mark the rest of the root as missing --
+        # doing so used to delete unrelated file_paths and silently dropped
+        # review groups/decisions belonging to other plans (found in NAS E2E).
         for root in roots:
-            db.execute("DELETE FROM file_paths WHERE root_id=? AND seen_gen<?", (root["id"], gen))
+            base = root["mount_path"]
+            seen_dirs = visited.get(int(root["id"]), set())
+            stale = db.query(
+                "SELECT dev, ino, path FROM file_paths WHERE root_id=? AND seen_gen<?",
+                (root["id"], gen),
+            )
+            for row in stale:
+                path = row["path"]
+                rel = os.path.relpath(path, base)
+                if _excluded(rel, exclude):
+                    continue
+                if include and not _included(rel, include):
+                    continue
+                parent = os.path.dirname(path)
+                if parent in seen_dirs or not os.path.isdir(parent):
+                    db.execute(
+                        "DELETE FROM file_paths WHERE dev=? AND ino=? AND path=?",
+                        (row["dev"], row["ino"], path),
+                    )
         db.commit()
         db.execute(
             "UPDATE files SET status='missing' WHERE seen_gen<? AND NOT EXISTS "
@@ -326,17 +356,17 @@ class Scanner:
         )
         db.commit()
         counts = json.loads(db.get_setting("dir_counts_json", "{}") or "{}")
-        prev_total = sum(counts.values())
-        if prev_total and stats["dirs_scanned"] < prev_total * 0.8:
+        new_counts = {str(r["id"]): len(visited.get(int(r["id"]), ())) for r in roots}
+        prev_total = sum(counts.get(k, 0) for k in new_counts)
+        new_total = sum(new_counts.values())
+        if prev_total and not include and not exclude and new_total < prev_total * 0.8:
             db.execute(
                 "UPDATE scan_runs SET incomplete_reason=? WHERE seen_gen=?",
                 ("本次扫描目录数比上次少 20% 以上，可能挂载或权限异常", gen),
             )
             db.commit()
-        db.set_setting(
-            "dir_counts_json",
-            json.dumps({str(r["id"]): stats["dirs_scanned"] for r in roots}),
-        )
+        counts.update(new_counts)
+        db.set_setting("dir_counts_json", json.dumps(counts))
 
     # ---- hashing ---------------------------------------------------------
     def _hash_candidates(self, run_id, limiter, window, stats) -> None:
