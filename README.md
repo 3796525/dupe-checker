@@ -29,19 +29,22 @@ dupe-checker 扫描你指定的目录，找出两类对象：
 
 一句话：**找重复靠工具，删文件靠人**。
 
-## 功能（规划中）
+## 功能
 
-- [ ] Docker Compose 单镜像部署，兼容飞牛 fnOS 与普通 Linux
-- [ ] 首次配置向导：自选扫描目录、包含/排除规则
-- [ ] 扫描默认关闭；支持手动 / 每日 / 每周 / 自定义间隔 / 仅提醒
-- [ ] 三级判定：大小 → 采样快哈希 → 全量 SHA-256（带哈希缓存）
-- [ ] 增量扫描、断点续扫、限速与低优先级
-- [ ] 双视图审核：同名候选 / 内容重复（默认保留 mtime 最早的一份）
-- [ ] 删除方案导出 JSON / CSV / HTML（含指纹与复核状态）
+- [x] Docker Compose 单镜像部署，兼容飞牛 fnOS 与普通 Linux
+- [x] 自选扫描目录（多套扫描方案、包含/排除规则）
+- [x] 扫描默认关闭；支持手动 / 每日 / 每周 / 自定义间隔 / 仅提醒
+- [x] 三级判定：大小 → 采样快哈希 → 全量 SHA-256（带哈希缓存）
+- [x] 增量扫描、断点续扫、限速与低优先级
+- [x] 双视图审核：同名候选 / 内容重复（默认保留 mtime 最早的一份）
+- [x] 删除方案导出 JSON / CSV / HTML（含指纹与复核状态）
+- [ ] fnOS 应用包（.fpk）封装：先跑通 Compose，再上架形态（规划中）
+- [ ] 缩略图预览：v1 不提供（会读图片内容、增加权限面），规划中
 
 ## 状态
 
-项目按企业七阶段流程推进，当前：**需求基线（阶段 2/7）**。
+项目按企业七阶段流程推进，当前：**开发编码（阶段 4/7）**。
+代码已实现并通过 51 项自动化测试；真机体验与性能压测在 NAS 上进行。
 
 ## 关于本项目：由 AI 开发
 
@@ -54,18 +57,63 @@ dupe-checker 扫描你指定的目录，找出两类对象：
 - 作者与分工：见 [AUTHORS.md](AUTHORS.md)
 - 安全问题报告：见 [SECURITY.md](SECURITY.md)
 
-## 部署
+## 快速开始（Docker Compose）
 
-待开发阶段完成后提供。目标形态：
+    git clone https://github.com/3796525/dupe-checker.git
+    cd dupe-checker
+    cp .env.example .env
 
-    services:
-      dupe-checker:
-        image: ghcr.io/3796525/dupe-checker:latest   # 待发布
-        user: "1001:1001"        # 受限 NAS 账号
-        volumes:
-          - /vol1/1000/我的图库:/data:ro     # 只读挂载
-        ports:
-          - "8080:8080"
+编辑 `.env`，至少改两项：
+
+- `SCAN_ROOT`：要扫描的绝对路径。**必须以运行容器的账号可读为前提**，容器会以 `:ro` 只读挂载它。
+- `APP_UID` / `APP_GID`：容器运行身份，要等于 `SCAN_ROOT` 的读权限持有者（飞牛功能受限账号 dsh-test 是 `1001:1001`，普通 Linux 通常是 `1000:1000`）。
+
+准备数据目录（索引、导出、会话都放这里，也是容器唯一可写的位置）：
+
+    mkdir -p data && sudo chown -R 1001:1001 data   # 换成你的 APP_UID:APP_GID
+
+启动：
+
+    docker compose up -d --build
+    docker compose ps          # 等待 healthy
+    # 浏览器打开 http://<NAS 或笔记本 IP>:8080
+
+首次访问会要求设置访问密码（至少 10 位，bcrypt 存储）。设置完成后进入系统。
+
+扫描多个目录：
+
+    docker compose -f docker-compose.yml -f compose.multiroot.example.yaml up -d
+
+### 使用流程
+
+1. **扫描根**：确认容器启动自检通过（页面顶部会显示只读自检状态）。
+2. **扫描方案**：选目录、可加包含/排除规则、选触发方式（仅手动 / 每日 / 每周 / 间隔 / 仅提醒）。
+3. **执行扫描**：点「立即扫描」，扫描中可暂停/继续/取消；扫描结束自动生成审核分组。
+4. **审核**：在「内容重复」或「同名候选」里逐组决定保留/删除，每组必须至少保留 1 份。
+5. **生成删除方案**：工具会重新核对每个待删文件的大小、mtime、SHA-256，变化过的标为「需复核」。
+6. **导出 + 手工删除**：下载 CSV / JSON / HTML，按路径自己在 NAS 上删除；工具不提供删除按钮，也不生成 rm 命令。
+
+### 目录结构
+
+    app/             FastAPI 应用（扫描、审核、方案、导出、Web）
+    app/templates/   Jinja2 页面
+    app/static/      CSS / JS
+    tests/           pytest 测试（51 项）
+    docs/            需求、设计、开发说明等项目文档
+    main.py          启动入口
+    docker-compose.yml / Dockerfile / .env.example
+
+### 开发（本机跑测试）
+
+    python3.11 -m venv .venv && . .venv/bin/activate
+    pip install -r requirements-dev.txt
+    python -m pytest
+
+### 安全边界（部署前请确认）
+
+- `SCAN_ROOT` 必须用 `:ro` 挂载；写成可写会在启动自检阶段被拒绝启动。
+- 端口只在内网开放，不要做公网端口映射。
+- 容器 rootfs 只读、capabilities 全丢、`no-new-privileges`。
 
 ## 许可
 
