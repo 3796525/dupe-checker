@@ -14,6 +14,14 @@ dupe-checker 的设计目标：**即使代码有漏洞，也无法破坏用户�
 8. 导出只在方案通过复核（status=final）时放行，导出前再次核对 keep 文件未被改动，否则整份拒绝（409）。
 9. 日志与导出文件中不包含口令、token、密钥。
 
+## 访问方式（AUTH_MODE）
+- 默认 AUTH_MODE=password：首次启动从容器日志取一次性初始化令牌，在 /setup 设置口令后使用。
+- AUTH_MODE=none：免登录，打开页面直接用。仅建议在可信内网使用。
+  - 仍会为浏览器签发 CSRF 会话，跨站伪造的写请求依然被拒绝。
+  - 能访问该端口的人可以查看文件清单、触发扫描、导出清单；工具本身没有任何删除、写入、执行命令的能力。
+  - 不要把端口暴露到公网；仅内网监听是这一模式的前提。
+  - 恢复口令登录：把 AUTH_MODE 改回 password 并重启容器，再访问 /setup。
+
 ## 首次初始化
 
 首次 `docker compose up -d` 后，容器日志会打印一次性初始化令牌（形如 `setup token: xxxx`）。请通过 `docker compose logs dupe-checker | grep -A2 "setup token"` 获取，并立即在 `/setup` 页面完成口令设置。设置成功后令牌文件自动删除；若日志不可见，可用环境变量 `DUPE_SETUP_TOKEN` 指定令牌，或在数据目录直接读取 `setup_token` 文件（仅限容器内/宿主 root）。

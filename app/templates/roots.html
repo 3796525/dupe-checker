@@ -1,82 +1,101 @@
 {% extends "base.html" %}
 {% block title %}可扫描目录 · 重复文件核查器{% endblock %}
 {% block content %}
-<h1>可扫描目录</h1>
-<p class="page-sub">这里列出工具能看到的全部目录。它们来自 NAS 管理员给受限账号的授权，并由容器以只读方式挂载。</p>
+<div class="page-head">
+  <div>
+    <h1>可扫描目录</h1>
+    <p class="page-sub">工具只能看到下面这些目录（NAS 管理员授权 + 容器只读挂载）。目录多的时候列表也很紧凑，创建扫描方案时再勾选要扫哪些。</p>
+  </div>
+  <div class="row" style="margin:0">
+    <a class="button primary" href="/plans">创建扫描方案</a>
+  </div>
+</div>
 
 {% if guard.unsafe %}
 <div class="notice" style="border-color:rgba(238,93,93,.45);background:rgba(238,93,93,.08);color:#ffd2d2">
   <strong>只读自检未通过，扫描与导出已暂停。</strong> {{ guard.unsafe_reason }}
 </div>
 {% else %}
-<p class="small muted">只读自检：通过（最近检查 {{ guard.verified_at or '启动时' }}）。工具会反复抽样检查子目录，发现任一目录可写就立即暂停操作。</p>
+<p class="small muted">🛡 只读自检通过（最近检查 {{ guard.verified_at or '启动时' }}）：工具会反复抽样检查子目录，发现任一目录可写就立即暂停扫描与导出。</p>
 {% endif %}
 
-<div class="help">
-  <h3>关于这些目录</h3>
-  <ul>
-    <li>工具只能看到下面列出的目录，无法访问授权范围之外的任何路径。</li>
-    <li>目录以「只读」方式挂载，工具不会创建、修改、移动或删除文件。</li>
-    <li>下面的文件数和占用来自最近一次扫描的索引；还没扫描过时显示为「—」。</li>
-    <li>如果看不到想要的目录，需要在 NAS 上给受限账号授权，并在部署配置里添加只读挂载（详见 README）。</li>
-  </ul>
-</div>
-
+{% set ns = namespace(files=0, bytes=0, readonly=0) %}
 {% for t in trees %}
-<div class="card">
-  <h2>
-    {{ t.root.label or t.root.mount_path }}
-    {% if t.guard and t.guard.readonly and t.guard.readable %}
-      <span class="pill ok">只读已验证</span>
-    {% elif guard.unsafe %}
-      <span class="pill failed">自检未通过</span>
-    {% else %}
-      <span class="pill">未验证</span>
-    {% endif %}
-  </h2>
-  <p class="small muted mono">{{ t.root.mount_path }}</p>
-
-  <div class="grid" style="margin:14px 0 6px">
-    <div class="stat"><div class="num">{{ t.summary.files }}</div><div class="label">已索引文件</div></div>
-    <div class="stat"><div class="num">{{ t.summary.bytes | bytes }}</div><div class="label">已索引占用</div></div>
-    <div class="stat"><div class="num">{{ t.entries | length }}</div><div class="label">顶层项目</div></div>
-  </div>
-
-  {% if t.summary.files == 0 %}
-    <p class="muted small">这个目录还没有被扫描过，所以暂时没有文件数和占用数据。去「扫描方案」创建方案并运行即可。</p>
-  {% endif %}
-
-  <details>
-    <summary>查看目录内容<span class="muted small">（共 {{ t.entries | length }} 项，按目录优先排序）</span></summary>
-    {% if t.entries %}
-    <div class="table-wrap">
-    <table>
-      <thead><tr><th>名称</th><th>类型</th><th>文件数</th><th>占用</th></tr></thead>
-      <tbody>
-      {% for e in t.entries %}
-      <tr>
-        <td>{{ '📁' if e.is_dir else '📄' }} {{ e.name }}{% if e.stale %} <span class="pill needs_recheck">索引中存在，当前未找到</span>{% endif %}</td>
-        <td class="muted">{{ '目录' if e.is_dir else '文件' }}</td>
-        <td>{{ e.files if e.files is not none else '—' }}</td>
-        <td>{{ e.bytes | bytes if e.bytes is not none else '—' }}</td>
-      </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    </div>
-    {% else %}
-      <p class="muted">空目录。</p>
-    {% endif %}
-  </details>
-</div>
-{% else %}
-<div class="card">
-  <h2>没有可扫描目录</h2>
-  <p class="muted">请检查容器环境变量 <code>MOUNT_ROOTS</code> 和 <code>SCAN_ROOT</code>，确认目标目录已以只读方式挂载。具体步骤见仓库 README 的「快速开始」。</p>
-</div>
+  {% set ns.files = ns.files + (t.summary.files or 0) %}
+  {% set ns.bytes = ns.bytes + (t.summary.bytes or 0) %}
+  {% if t.guard and t.guard.readonly and t.guard.readable %}{% set ns.readonly = ns.readonly + 1 %}{% endif %}
 {% endfor %}
 
-<div class="row">
-  <a class="button primary" href="/plans">下一步：创建扫描方案</a>
+<div class="card card-tight">
+  <div class="kpi-inline">
+    <div><b>{{ trees | length }}</b><span>可扫描目录</span></div>
+    <div><b>{{ ns.readonly }}/{{ trees | length }}</b><span>只读已验证</span></div>
+    <div><b>{{ ns.files }}</b><span>已索引文件</span></div>
+    <div><b>{{ ns.bytes | bytes }}</b><span>已索引占用</span></div>
+  </div>
 </div>
+
+<div class="root-list">
+{% for t in trees %}
+  <div class="root-item">
+    <div class="root-row">
+      <div class="root-id">
+        <div class="root-name">
+          <span class="root-ico">📁</span>{{ t.root.label or t.root.mount_path }}
+          {% if t.guard and t.guard.readonly and t.guard.readable %}
+            <span class="pill ok">只读已验证</span>
+          {% elif guard.unsafe %}
+            <span class="pill failed">自检未通过</span>
+          {% else %}
+            <span class="pill">未验证</span>
+          {% endif %}
+        </div>
+        <div class="root-path mono small muted">{{ t.root.mount_path }}</div>
+      </div>
+      <div class="root-stat"><b>{{ t.summary.files if t.summary.files else '—' }}</b><span>文件</span></div>
+      <div class="root-stat"><b>{{ t.summary.bytes | bytes if t.summary.files else '—' }}</b><span>占用</span></div>
+      <div class="root-stat"><b>{{ t.entries | length }}</b><span>顶层项目</span></div>
+    </div>
+    <details class="root-details">
+      <summary>查看顶层内容（{{ t.entries | length }} 项，按目录优先排序）</summary>
+      {% if t.entries %}
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>名称</th><th>类型</th><th>文件数</th><th>占用</th></tr></thead>
+        <tbody>
+        {% for e in t.entries %}
+        <tr>
+          <td>{{ '📁' if e.is_dir else '📄' }} {{ e.name }}{% if e.stale %} <span class="pill needs_recheck">索引中存在，当前未找到</span>{% endif %}</td>
+          <td class="muted">{{ '目录' if e.is_dir else '文件' }}</td>
+          <td>{{ e.files if e.files is not none else '—' }}</td>
+          <td>{{ e.bytes | bytes if e.bytes is not none else '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      {% else %}
+        <p class="muted">空目录。</p>
+      {% endif %}
+      {% if t.summary.files == 0 %}
+        <p class="muted small">这个目录还没有被扫描过：到「扫描方案」创建方案并运行后，这里会显示每个顶层项目的大小。</p>
+      {% endif %}
+    </details>
+  </div>
+{% else %}
+  <div class="card">
+    <h2>没有可扫描目录</h2>
+    <p class="muted">请检查容器环境变量 <code>MOUNT_ROOTS</code> 和 <code>SCAN_ROOT</code>，确认目标目录已以只读方式挂载。具体步骤见仓库 README 的「快速开始」。</p>
+  </div>
+{% endfor %}
+</div>
+
+<details class="card">
+  <summary>这些目录是怎么来的？为什么看不到其他文件夹？</summary>
+  <ul class="muted small">
+    <li>目录来自 NAS 管理员给受限账号的授权，并由容器以「只读」方式挂载；工具无法访问授权范围之外的任何路径。</li>
+    <li>目录名和文件数来自最近一次扫描的索引；没扫描过时显示「—」。</li>
+    <li>要新增目录：在 NAS 上给受限账号授权，并在部署配置里添加只读挂载（详见 README）。</li>
+  </ul>
+</details>
 {% endblock %}

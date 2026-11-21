@@ -35,13 +35,19 @@ class Config:
         # HTTPS (directly or through a TLS reverse proxy).
         secure_mode = _env("SESSION_COOKIE_SECURE", "auto").lower()
         self.session_cookie_secure = secure_mode if secure_mode in ("auto", "always", "never") else "auto"
+        # AUTH_MODE=password (default) requires a login password.  "none" is
+        # for a trusted LAN-only deployment of this read-only tool: pages open
+        # without a password, but a CSRF-protected session is still created so
+        # state-changing API calls cannot be forged by other websites.
+        auth_mode = _env("AUTH_MODE", "password").lower()
+        self.auth_mode = auth_mode if auth_mode in ("password", "none") else "password"
         self.login_rate_limit = int(_env("LOGIN_RATE_LIMIT", "5"))
         self.login_rate_window = int(_env("LOGIN_RATE_WINDOW", "60"))
         # Guard deep check (P1-05): per-root nested sampling + periodic recheck.
         self.guard_interval_seconds = max(60, int(_env("GUARD_INTERVAL_SECONDS", "1800")))
         self.guard_sample_limit = max(0, int(_env("GUARD_SAMPLE_LIMIT", "20")))
         self.guard_max_depth = max(1, int(_env("GUARD_MAX_DEPTH", "3")))
-        self.version = "0.1.0"
+        self.version = "0.1.7"
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.db_path.parent, self.export_dir, self.log_dir):

@@ -96,6 +96,8 @@ dupe-checker 扫描你指定的目录，找出两类对象：
 
 说明：初始化令牌只在首次设置口令前有效，设置成功后自动删除；若容器日志不便查看，可在 `.env` 里设置 `DUPE_SETUP_TOKEN` 指定自己的令牌。
 
+只想在可信内网用、不想每次输口令？在 `.env` 里设置 `AUTH_MODE=none` 再重启（默认仍是 `password`）。这一模式打开页面即用，但仍会签发 CSRF 会话；任何能访问端口的人都能看文件清单、触发扫描和导出清单（工具依然没有任何删除/写入能力），所以**不要暴露到公网**。想恢复口令登录，把 `AUTH_MODE` 改回 `password` 并重启，再访问 `/setup`。
+
 扫描多个目录：
 
     docker compose -f docker-compose.yml -f compose.multiroot.example.yaml up -d
@@ -115,7 +117,7 @@ dupe-checker 扫描你指定的目录，找出两类对象：
     app/             FastAPI 应用（扫描、审核、方案、导出、Web）
     app/templates/   Jinja2 页面
     app/static/      CSS / JS
-    tests/           pytest 测试（115 项，覆盖率 82%）
+    tests/           pytest 测试（119 项，覆盖率 83%）
     docs/            需求、设计、开发说明等项目文档
     main.py          启动入口
     docker-compose.yml / Dockerfile / .env.example
@@ -133,6 +135,7 @@ dupe-checker 扫描你指定的目录，找出两类对象：
 - 容器 rootfs 只读、capabilities 全丢、`no-new-privileges`。
 - 会话默认 8 小时过期，注销会服务端吊销旧会话；会话 cookie 在内网 HTTP 下不加 Secure，走反代/TLS 时设 `SESSION_COOKIE_SECURE=always`。
 - 首启未设置口令前，任何未携带初始化令牌的 `/setup` 请求都会被拒绝（403），不会暴露"是否已初始化"。
+- `AUTH_MODE=none`（免登录）仅限可信内网；它不降低只读边界，但会让同网段的人也能触发扫描和查看清单。
 
 ## 许可
 

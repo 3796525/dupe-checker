@@ -8,7 +8,7 @@
   <h3>第一次用？按这个顺序就好</h3>
   <ol>
     <li>给方案起个名字（例如「全部目录」）。</li>
-    <li>勾选要扫描的目录。</li>
+    <li>勾选要扫描的目录；目录多时用「全选/全不选」和筛选框。</li>
     <li>「扫描时机」保持默认的「仅手动」也可以；之后再改成每天/每周。</li>
     <li>点「创建方案」，然后在方案卡片上点「立即扫描」。</li>
   </ol>
@@ -22,25 +22,37 @@
     </label>
 
     <fieldset class="full">
-      <legend>要扫描哪些目录</legend>
-      {% for r in roots %}
-      <label class="inline">
-        <input type="checkbox" name="root_ids" value="{{ r.id }}" checked>
-        {{ r.label or r.mount_path }}
-        <span class="muted small mono">{{ r.mount_path }}</span>
-      </label>
-      {% else %}
-      <p class="muted">没有可扫描目录，请先到「可扫描目录」检查部署配置。</p>
-      {% endfor %}
+      <legend>要扫描哪些目录 <span class="muted small" id="root-count">（已选 {{ roots | length }} / {{ roots | length }}）</span></legend>
+      <div class="picker-tools">
+        {% if roots | length > 6 %}
+        <input id="root-filter" class="picker-filter" placeholder="筛选目录…" autocomplete="off">
+        {% endif %}
+        <button type="button" class="linklike" onclick="pickAll(true)">全选</button>
+        <button type="button" class="linklike" onclick="pickAll(false)">全不选</button>
+      </div>
+      <div class="picker" id="root-picker">
+        {% for r in roots %}
+        <label class="picker-item" data-name="{{ ((r.label or r.mount_path) ~ ' ' ~ r.mount_path) | lower }}">
+          <input type="checkbox" name="root_ids" value="{{ r.id }}" checked>
+          <span class="picker-text">
+            <b>{{ r.label or r.mount_path }}</b>
+            <span class="mono small muted">{{ r.mount_path }}</span>
+          </span>
+        </label>
+        {% else %}
+        <p class="muted">没有可扫描目录，请先到「可扫描目录」检查部署配置。</p>
+        {% endfor %}
+      </div>
+      <span class="hint">默认全选；只想扫部分目录时点掉不需要的。之后也可以在已有方案上调整。</span>
     </fieldset>
 
     <label>扫描时机
       <select name="trigger_type" id="trigger-type">
-        <option value="manual">仅手动（推荐，最省电、最不影响 NAS）</option>
+        <option value="manual">仅手动（推荐）</option>
         <option value="daily">每天定时</option>
         <option value="weekly">每周定时</option>
         <option value="interval">每隔一段时间</option>
-        <option value="notify_only">仅提醒我，不自动扫描</option>
+        <option value="notify_only">仅提醒，不自动扫描</option>
       </select>
       <span class="hint">初次使用建议先「仅手动」，确认效果后再改成定时。</span>
     </label>
@@ -81,19 +93,22 @@
 
 <h2>已有方案</h2>
 {% for p in plans %}
-<div class="card">
-  <h3>
-    {{ p.name }}
-    <span class="pill {{ 'ok' if p.enabled else '' }}">{{ '定时已启用' if p.enabled else '仅手动' }}</span>
-  </h3>
-  <p class="muted small">
-    扫描时机：{{ p.trigger_text }} · 扫描目录：{{ p.roots_text }}
-    · 速率：{{ p.rate_hash }} MB/s
-  </p>
-  <div class="row">
-    <button class="primary" onclick="runScan({{ p.id }})">立即扫描</button>
-    <button onclick="togglePlan({{ p.id }}, {{ 'false' if p.enabled else 'true' }})">{{ '停用定时' if p.enabled else '启用定时' }}</button>
-    <button class="danger" onclick="deletePlan({{ p.id }})">删除方案</button>
+<div class="card card-tight">
+  <div class="plan-row">
+    <div class="plan-main">
+      <h3>
+        {{ p.name }}
+        <span class="pill {{ 'ok' if p.enabled else '' }}">{{ '定时已启用' if p.enabled else '仅手动' }}</span>
+      </h3>
+      <p class="muted small">
+        扫描时机：{{ p.trigger_text }} · 扫描目录：{{ p.roots_text }} · 速率：{{ p.rate_hash }} MB/s
+      </p>
+    </div>
+    <div class="row" style="margin:0;flex-wrap:nowrap">
+      <button class="primary" onclick="runScan({{ p.id }})">立即扫描</button>
+      <button onclick="togglePlan({{ p.id }}, {{ 'false' if p.enabled else 'true' }})">{{ '停用定时' if p.enabled else '启用定时' }}</button>
+      <button class="danger" onclick="deletePlan({{ p.id }})">删除方案</button>
+    </div>
   </div>
 </div>
 {% else %}
@@ -117,6 +132,30 @@ function syncTriggerFields() {
 }
 triggerType.addEventListener('change', syncTriggerFields);
 syncTriggerFields();
+
+const picker = document.getElementById('root-picker');
+const countEl = document.getElementById('root-count');
+const boxes = () => [...picker.querySelectorAll('input[name=root_ids]')];
+function updateCount() {
+  const all = boxes();
+  const n = all.filter(x => x.checked).length;
+  if (countEl) countEl.textContent = '（已选 ' + n + ' / ' + all.length + '）';
+}
+function pickAll(on) {
+  boxes().forEach(x => { if (x.closest('.picker-item').style.display !== 'none') x.checked = on; });
+  updateCount();
+}
+picker.addEventListener('change', updateCount);
+updateCount();
+const filter = document.getElementById('root-filter');
+if (filter) {
+  filter.addEventListener('input', () => {
+    const q = filter.value.trim().toLowerCase();
+    [...picker.querySelectorAll('.picker-item')].forEach(el => {
+      el.style.display = (!q || el.dataset.name.includes(q)) ? '' : 'none';
+    });
+  });
+}
 
 document.getElementById('plan-form').addEventListener('submit', async (e) => {
   e.preventDefault();

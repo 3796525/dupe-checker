@@ -30,6 +30,7 @@ services:
       PORT: "8080"
       TZ: ${TZ:-Asia/Shanghai}
       MOUNT_ROOTS: ${SCAN_ROOT:?set SCAN_ROOT in .env to the directory you want scanned}
+      AUTH_MODE: ${AUTH_MODE:-password}
     volumes:
       - ./data:/data
       - "${SCAN_ROOT:?set SCAN_ROOT in .env}:${SCAN_ROOT:?set SCAN_ROOT in .env}:ro"

@@ -44,7 +44,11 @@
     </div>
     <div class="side-foot-row">
       <span class="version">v{{ version }}</span>
+      {% if auth_disabled %}
+      <span class="muted small" title="AUTH_MODE=none：免登录，仅建议在可信内网使用">免登录 · 仅内网</span>
+      {% else %}
       <button class="linklike" type="button" onclick="doLogout()">退出登录</button>
+      {% endif %}
     </div>
   </div>
 </aside>
@@ -54,7 +58,7 @@
     <button class="menu-toggle" type="button" onclick="toggleNav(true)" aria-label="打开菜单">☰</button>
     <span class="top-note">🔒 全程只读扫描 · 删除由你本人在 NAS 上完成</span>
     <span class="top-spacer"></span>
-    <span class="top-user">已登录</span>
+    <span class="top-user">{{ '免登录模式（仅内网）' if auth_disabled else '已登录' }}</span>
   </div>
   <main>
   {% block content %}{% endblock %}

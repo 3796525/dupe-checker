@@ -594,3 +594,67 @@ def test_review_detail_page_warns_when_file_missing(client, db, root):
     assert page.status_code == 200
     assert "索引与磁盘不一致" in page.text
     assert "文件已不存在" in page.text
+
+# ---------------------------------------------------------------------------
+# 迭代 8: AUTH_MODE=none (trusted LAN, read-only deployment)
+# ---------------------------------------------------------------------------
+def _csrf_from_page(html: str) -> str:
+    marker = '<meta name="csrf" content="'
+    start = html.index(marker) + len(marker)
+    return html[start:html.index('"', start)]
+
+
+def test_auth_disabled_opens_pages_without_password(web, monkeypatch):
+    monkeypatch.setattr(web.config, "auth_mode", "none")
+    client = TestClient(web.app)
+    home = client.get("/")
+    assert home.status_code == 200
+    assert "免登录模式" in home.text
+    assert 'onclick="doLogout()"' not in home.text
+    # A CSRF-protected session is still issued on the first page load.
+    assert SESSION_COOKIE in client.cookies
+    settings = client.get("/settings")
+    assert settings.status_code == 200
+    assert "已关闭口令登录" in settings.text
+    assert 'id="pwd-form"' not in settings.text
+
+
+def test_auth_disabled_redirects_auth_pages_and_endpoints(web, monkeypatch):
+    monkeypatch.setattr(web.config, "auth_mode", "none")
+    client = TestClient(web.app)
+    setup = client.get("/setup", follow_redirects=False)
+    assert setup.status_code == 303 and setup.headers["location"] == "/"
+    login_page = client.get("/login", follow_redirects=False)
+    assert login_page.status_code == 303 and login_page.headers["location"] == "/"
+    login_api = client.post("/api/v1/auth/login", json={"password": "whatever-123"})
+    assert login_api.status_code == 403
+    assert login_api.json()["error"]["code"] == "AUTH_DISABLED"
+    setup_api = client.post("/api/v1/auth/setup", json={"password": "whatever-123", "token": "x"})
+    assert setup_api.status_code == 403
+    assert setup_api.json()["error"]["code"] == "AUTH_DISABLED"
+
+
+def test_auth_disabled_still_requires_session_and_csrf(web, monkeypatch):
+    monkeypatch.setattr(web.config, "auth_mode", "none")
+    client = TestClient(web.app)
+    # No page loaded yet -> no session cookie -> API refuses instead of trusting.
+    assert client.post("/api/v1/scans", json={"plan_id": 1}).status_code == 401
+    csrf = _csrf_from_page(client.get("/").text)
+    body = {"default_keep_policy": "earliest_mtime"}
+    forged = client.put("/api/v1/settings", json=body)
+    assert forged.status_code == 403
+    ok = client.put("/api/v1/settings", json=body, headers={CSRF_HEADER: csrf})
+    assert ok.status_code == 200
+
+
+def test_roots_and_plans_pages_use_compact_layout(client, db, root):
+    _prepared_scan(client, db, root)
+    roots_html = client.get("/roots").text
+    assert 'class="root-row"' in roots_html
+    assert "kpi-inline" in roots_html
+    assert "查看顶层内容" in roots_html
+    plans_html = client.get("/plans").text
+    assert 'class="picker-item"' in plans_html
+    assert 'id="root-count"' in plans_html
+    assert "全选" in plans_html and "全不选" in plans_html
+

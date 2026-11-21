@@ -2,7 +2,7 @@
 {% block title %}设置 · 重复文件核查器{% endblock %}
 {% block content %}
 <h1>设置</h1>
-<p class="page-sub">这里可以查看安全自检结果、调整审核默认策略和修改登录口令。</p>
+<p class="page-sub">这里可以查看安全自检结果、调整审核默认策略{{ '' if auth_disabled else '和修改登录口令' }}。</p>
 
 <div class="card">
   <h2>只读安全自检</h2>
@@ -47,6 +47,17 @@
   </form>
 </div>
 
+{% if auth_disabled %}
+<div class="card">
+  <h2>登录与访问</h2>
+  <p class="notice ok" style="margin:0 0 8px">已关闭口令登录（AUTH_MODE=none）：打开页面即可使用，无需口令。</p>
+  <ul class="muted small">
+    <li>任何能访问本地址的人都可以查看文件清单、触发扫描、导出删除清单（全部只读，没有任何删除/写入能力）。</li>
+    <li>只建议在可信内网使用，不要把端口映射到公网。</li>
+    <li>想恢复口令登录：在部署环境把 <code>AUTH_MODE</code> 改成 <code>password</code> 并重启容器，再打开 <code>/setup</code> 设置口令。</li>
+  </ul>
+</div>
+{% else %}
 <div class="card">
   <h2>修改登录口令</h2>
   <form id="pwd-form" class="form-grid">
@@ -55,6 +66,7 @@
     <div><button class="primary" type="submit">修改</button> <span id="pwd-msg" class="muted small"></span></div>
   </form>
 </div>
+{% endif %}
 
 <details class="card">
   <summary>高级：扫描速率</summary>
@@ -83,11 +95,14 @@ document.getElementById('rate-form').addEventListener('submit', async (e) => {
   });
   document.getElementById('rate-msg').textContent = r.ok ? '已保存' : '保存失败';
 });
-document.getElementById('pwd-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const f = e.target;
-  const r = await api('POST', '/api/v1/settings/password', {old_password: f.old.value, new_password: f.new.value});
-  document.getElementById('pwd-msg').textContent = r.ok ? '已修改，请重新登录' : ((r.data.error || {}).message || '失败');
-});
+const pwdForm = document.getElementById('pwd-form');
+if (pwdForm) {
+  pwdForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const r = await api('POST', '/api/v1/settings/password', {old_password: f.old.value, new_password: f.new.value});
+    document.getElementById('pwd-msg').textContent = r.ok ? '已修改，请重新登录' : ((r.data.error || {}).message || '失败');
+  });
+}
 </script>
 {% endblock %}

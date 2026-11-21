@@ -272,3 +272,47 @@ details .muted { font-weight: 400; }
   .kpi-num { font-size: 24px; }
   .content-top .top-user { display: none; }
 }
+/* --- compact roots list (iteration 8) --- */
+.card-tight { padding-bottom: 14px; }
+.kpi-inline { display: flex; flex-wrap: wrap; gap: 28px; align-items: baseline; }
+.kpi-inline > div { display: flex; flex-direction: column; }
+.kpi-inline b { font-size: 20px; line-height: 1.2; }
+.kpi-inline span { color: var(--muted); font-size: 12px; }
+.root-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.root-item { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.root-row { display: grid; grid-template-columns: minmax(0, 1fr) repeat(3, minmax(64px, auto)); gap: 12px 18px; align-items: center; padding: 12px 14px; }
+.root-id { min-width: 0; }
+.root-name { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.root-ico { font-size: 15px; }
+.root-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.root-stat { display: flex; flex-direction: column; align-items: flex-end; }
+.root-stat b { font-size: 15px; }
+.root-stat span { color: var(--muted); font-size: 11px; }
+.root-details { border-top: 1px dashed var(--line); padding: 0 14px; }
+.root-details > summary { cursor: pointer; padding: 5px 0 6px; color: var(--muted); font-size: 12.5px; list-style: none; }
+.root-details > summary::before { content: "\25B8  "; }
+.root-details[open] > summary::before { content: "\25BE  "; }
+.root-details[open] > summary { color: var(--fg); }
+@media (max-width: 640px) {
+  .root-row { grid-template-columns: repeat(3, 1fr); }
+  .root-id { grid-column: 1 / -1; }
+  .root-stat { align-items: flex-start; }
+}
+
+/* --- compact root picker (iteration 8) --- */
+.picker-tools { display: flex; gap: 14px; align-items: center; margin: 6px 0 10px; flex-wrap: wrap; }
+.picker-filter { flex: 1 1 180px; min-width: 140px; padding: 6px 10px; border-radius: 8px; }
+.picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.picker-item { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.picker-item:hover { border-color: var(--accent); }
+.picker-item input { margin-top: 3px; flex: none; }
+.picker-text { display: flex; flex-direction: column; min-width: 0; }
+.picker-text b { font-weight: 600; font-size: 13px; }
+.picker-text .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+
+/* --- compact plan list --- */
+.plan-row { display: flex; gap: 16px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.plan-main { min-width: 0; }
+.plan-main h3 { margin: 0 0 4px; }
+@media (max-width: 720px) { .plan-row { align-items: flex-start; } }
+

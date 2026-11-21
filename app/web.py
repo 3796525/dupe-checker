@@ -107,7 +107,14 @@ def _is_setup() -> bool:
     return bool(db.get_setting("password_hash"))
 
 
+def _auth_disabled() -> bool:
+    """AUTH_MODE=none: trusted-LAN deployment without a login password."""
+    return config.auth_mode == "none"
+
+
 def _require_page(request: Request) -> RedirectResponse | None:
+    if _auth_disabled():
+        return None
     if not _is_setup():
         return RedirectResponse("/setup", status_code=303)
     if not _session(request):
@@ -118,6 +125,11 @@ def _require_page(request: Request) -> RedirectResponse | None:
 def _require_api(request: Request) -> dict:
     sess = _session(request)
     if sess is None:
+        if _auth_disabled():
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "SESSION_MISSING", "message": "会话尚未建立，请刷新页面后重试"},
+            )
         raise HTTPException(status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"})
     # CSRF for state-changing methods
     if request.method not in ("GET", "HEAD", "OPTIONS"):
@@ -147,9 +159,19 @@ def _page(request: Request, template: str, **ctx):
     ctx.setdefault("request", request)
     ctx.setdefault("version", config.version)
     ctx.setdefault("nav", template.replace(".html", ""))
+    ctx.setdefault("auth_disabled", _auth_disabled())
     sess = _session(request)
+    new_token = None
+    if sess is None and _auth_disabled():
+        # Trusted-LAN mode: issue a CSRF-protected session on the first page
+        # load so state-changing API calls still require the token header.
+        new_token, csrf = sessions.create()
+        sess = {"csrf": csrf}
     ctx.setdefault("csrf", (sess or {}).get("csrf", ""))
-    return templates.TemplateResponse(request=request, name=template, context=ctx)
+    resp = templates.TemplateResponse(request=request, name=template, context=ctx)
+    if new_token:
+        _set_session_cookie(resp, new_token, request)
+    return resp
 
 
 def _json_error(code: str, message: str, status: int, details: dict | None = None) -> JSONResponse:
@@ -210,6 +232,9 @@ def _guard_unsafe_response() -> JSONResponse | None:
 
 def _init_setup_token() -> None:
     """First run: create the one-time /setup token and announce it on stdout."""
+    if _auth_disabled():
+        log.info("AUTH_MODE=none: 已关闭口令登录，跳过初始化令牌")
+        return
     if _is_setup():
         clear_setup_token()
         return
@@ -333,6 +358,8 @@ def _setup_token_page(request: Request, error: str = "") -> HTMLResponse:
 
 @app.get("/setup", response_class=HTMLResponse)
 def setup_page(request: Request, token: str = ""):
+    if _auth_disabled():
+        return RedirectResponse("/", status_code=303)
     if _is_setup():
         return RedirectResponse("/login", status_code=303)
     expected = load_setup_token()
@@ -345,6 +372,8 @@ def setup_page(request: Request, token: str = ""):
 
 @app.post("/api/v1/auth/setup")
 async def api_setup(request: Request):
+    if _auth_disabled():
+        return _json_error("AUTH_DISABLED", "当前已关闭口令登录（AUTH_MODE=none）", 403)
     if _is_setup():
         return _json_error("FORBIDDEN", "已初始化", 403)
     client = _client_ip(request)
@@ -377,6 +406,8 @@ async def api_setup(request: Request):
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
+    if _auth_disabled():
+        return RedirectResponse("/", status_code=303)
     if not _is_setup():
         return RedirectResponse("/setup", status_code=303)
     return _page(request, "login.html", error="")
@@ -384,6 +415,8 @@ def login_page(request: Request):
 
 @app.post("/api/v1/auth/login")
 async def api_login(request: Request):
+    if _auth_disabled():
+        return _json_error("AUTH_DISABLED", "当前已关闭口令登录（AUTH_MODE=none）", 403)
     client = request.client.host if request.client else "unknown"
     if limiter.is_blocked(client):
         return _json_error("RATE_LIMITED", "尝试过于频繁，请 60 秒后再试", 429)
