@@ -1,56 +1,124 @@
 {% extends "base.html" %}
 {% set status_text = {'running':'扫描中','completed':'已完成','paused':'已暂停','cancelled':'已取消','failed':'失败'} %}
 {% set phase_text = {'walk':'扫描目录和文件','hash':'比对文件内容','group':'整理重复分组','done':'已完成'} %}
-{% set pending = overview.review.by_status.get('pending', 0) %}
+{% set rv = overview.review %}
+{% set pending = rv.by_status.get('pending', 0) %}
+{% set maxn = [overview.content_groups, overview.name_groups, pending, 1] | max %}
 {% block title %}概览 · 重复文件核查器{% endblock %}
 {% block content %}
-<h1>概览</h1>
-<p class="page-sub">找到重复文件 → 由你审核确认 → 生成清单后手动删除。整个过程只读，本工具不会动你的文件。</p>
+<div class="page-head">
+  <div>
+    <h1>概览</h1>
+    <p class="page-sub" style="margin-bottom:0">找到重复文件 → 你审核确认 → 生成清单后自己在 NAS 上删除。全程只读。</p>
+  </div>
+  <div class="row">
+    <a class="button" href="/plans">扫描方案</a>
+    {% if rv.total_groups > 0 %}<a class="button primary" href="/review">去审核重复</a>{% endif %}
+  </div>
+</div>
 
 {% if overview.roots == 0 %}
 <div class="notice">
-  还没有可扫描的目录。请先在 NAS 上给受限账号授权目录，再在部署配置中添加只读挂载；遇到问题请查看「可扫描目录」页面。
+  还没有可扫描的目录。请先给受限账号授权目录，并在部署配置里以只读方式挂载；详见「可扫描目录」页面。
 </div>
 {% endif %}
 
-<h2>开始使用</h2>
-<div class="steps">
-  <div class="step {{ 'done' if overview.roots > 0 else 'current' }}">
-    <div class="n">{{ '✓' if overview.roots > 0 else '1' }}</div>
-    <h3>确认可扫描目录</h3>
-    <p>检查工具能看到哪些目录，以及它们是否已按只读方式挂载。</p>
-    <a class="button" href="/roots">查看目录</a>
+<div class="kpi-grid">
+  <a class="kpi" href="/roots">
+    <div class="kpi-head"><span class="kpi-ico">🗃️</span>已索引文件</div>
+    <div class="kpi-num">{{ overview.files }}</div>
+    <div class="kpi-sub">共 {{ overview.total_bytes | bytes }}，来自最近一次扫描</div>
+  </a>
+  <a class="kpi" href="/review?kind=content">
+    <div class="kpi-head"><span class="kpi-ico">♻️</span>内容重复可释放</div>
+    <div class="kpi-num">{{ overview.wasted_bytes | bytes }}</div>
+    <div class="kpi-sub">{{ overview.content_groups }} 组 · 内容完全一致，可安全合并</div>
+  </a>
+  <a class="kpi" href="/review">
+    <div class="kpi-head"><span class="kpi-ico">⏳</span>待审核分组</div>
+    <div class="kpi-num">{{ pending }}</div>
+    <div class="kpi-sub">已审核 {{ rv.reviewed }} 组 · 共 {{ rv.total_groups }} 组</div>
+  </a>
+  <a class="kpi" href="/review?kind=name">
+    <div class="kpi-head"><span class="kpi-ico">🏷️</span>同名候选组</div>
+    <div class="kpi-num">{{ overview.name_groups }}</div>
+    <div class="kpi-sub">名字相同，内容是否一致需你确认</div>
+  </a>
+</div>
+
+<div class="dash-cols">
+  <div class="card">
+    <h2>重复构成 <a class="more" href="/review">查看全部 →</a></h2>
+    <div class="bars">
+      <div class="bar-row">
+        <div class="bar-head"><span>内容重复组（可安全合并）</span><span>{{ overview.content_groups }} 组</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width: {{ (overview.content_groups / maxn * 100) | round(1) }}%"></div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-head"><span>同名候选组（需人工确认）</span><span>{{ overview.name_groups }} 组</span></div>
+        <div class="bar-track"><div class="bar-fill dim" style="width: {{ (overview.name_groups / maxn * 100) | round(1) }}%"></div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-head"><span>其中待审核</span><span>{{ pending }} 组</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width: {{ (pending / maxn * 100) | round(1) }}%"></div></div>
+      </div>
+    </div>
+    <p class="muted small" style="margin:14px 0 0">
+      内容重复：文件大小与 SHA-256 完全一致，保留一份即可。同名候选：文件名相同但内容未确认，需人工判断，<strong>不会</strong>自动进入删除清单。
+    </p>
   </div>
-  <div class="step {{ 'done' if overview.completed_scans > 0 else ('current' if overview.roots > 0 else '') }}">
-    <div class="n">{{ '✓' if overview.completed_scans > 0 else '2' }}</div>
-    <h3>创建方案并扫描</h3>
-    <p>默认不会自动扫描。创建一个方案，选择目录和扫描频率，然后手动发起一次。</p>
-    <a class="button" href="/plans">去创建扫描方案</a>
-  </div>
-  <div class="step {{ 'done' if overview.review.reviewed > 0 else ('current' if overview.completed_scans > 0 else '') }}">
-    <div class="n">{{ '✓' if overview.review.reviewed > 0 else '3' }}</div>
-    <h3>审核并生成删除清单</h3>
-    <p>逐组确认保留哪一份；审核完成后生成清单，再到 NAS 上手动删除。</p>
-    <a class="button" href="/review">去审核重复文件</a>
+
+  <div class="card">
+    <h2>优化建议</h2>
+    <div class="suggest">
+      {% if overview.roots == 0 %}
+      <div class="suggest-item"><span class="sico">📁</span><div><div class="stitle">先确认可扫描目录</div><div class="sdesc">工具还没看到任何只读挂载的目录。<a href="/roots">去检查 →</a></div></div></div>
+      {% endif %}
+      {% if overview.completed_scans == 0 %}
+      <div class="suggest-item"><span class="sico">🔎</span><div><div class="stitle">还没扫描过</div><div class="sdesc">工具不会自动扫描。先创建一个扫描方案，再点「立即扫描」。<a href="/plans">去创建 →</a></div></div></div>
+      {% endif %}
+      {% if pending > 0 %}
+      <div class="suggest-item"><span class="sico">✅</span><div><div class="stitle">有 {{ pending }} 组重复文件等你审核</div><div class="sdesc">建议从「内容重复」开始：这类文件内容完全一致，判断最可靠。<a href="/review?kind=content">开始审核 →</a></div></div></div>
+      {% endif %}
+      {% if rv.needs_recheck > 0 %}
+      <div class="suggest-item"><span class="sico">⚠️</span><div><div class="stitle">{{ rv.needs_recheck }} 组需要重新确认</div><div class="sdesc">组内文件在审核后发生了变化，请重新看一遍再决定。<a href="/review?status=needs_recheck">去处理 →</a></div></div></div>
+      {% endif %}
+      {% if rv.reviewed > 0 %}
+      <div class="suggest-item"><span class="sico">📄</span><div><div class="stitle">已审核 {{ rv.reviewed }} 组，可以生成删除清单</div><div class="sdesc">清单只是给你看的文件列表，工具不会执行删除。<a href="/delete-plans">去生成 →</a></div></div></div>
+      {% endif %}
+      <div class="suggest-item"><span class="sico">🔒</span><div><div class="stitle">全程只读，删除由你完成</div><div class="sdesc">目录以只读挂载，启动与运行期间反复探测写入；没有删除/移动/执行命令的接口。<a href="/settings">查看自检 →</a></div></div></div>
+    </div>
   </div>
 </div>
 
-<div class="grid">
-  <div class="stat"><div class="num">{{ overview.files }}</div><div class="label">已索引文件</div><div class="hint">上次扫描建立的索引</div></div>
-  <div class="stat"><div class="num">{{ overview.content_groups }}</div><div class="label">内容重复组</div><div class="hint">内容完全相同，可安全合并</div></div>
-  <div class="stat"><div class="num">{{ overview.name_groups }}</div><div class="label">同名候选组</div><div class="hint">名字一样，内容需人工确认</div></div>
-  <div class="stat"><div class="num">{{ (overview.wasted_bytes / 1048576) | round(1) }} MB</div><div class="label">潜在可释放空间</div><div class="hint">仅统计内容重复组</div></div>
-  <div class="stat"><div class="num">{{ pending }}</div><div class="label">待审核组</div><div class="hint">已审核 {{ overview.review.reviewed }} 组</div></div>
+<div class="card">
+  <h2>开始使用（三步）</h2>
+  <div class="steps">
+    <div class="step {{ 'done' if overview.roots > 0 else 'current' }}">
+      <div class="n">{{ '✓' if overview.roots > 0 else '1' }}</div>
+      <h3>确认可扫描目录</h3>
+      <p>检查工具能看到哪些目录，以及它们是否已按只读方式挂载。</p>
+      <a class="button" href="/roots">查看目录</a>
+    </div>
+    <div class="step {{ 'done' if overview.completed_scans > 0 else ('current' if overview.roots > 0 else '') }}">
+      <div class="n">{{ '✓' if overview.completed_scans > 0 else '2' }}</div>
+      <h3>创建方案并扫描</h3>
+      <p>默认不会自动扫描。创建一个方案，选择目录和触发方式，然后手动发起一次。</p>
+      <a class="button" href="/plans">去创建扫描方案</a>
+    </div>
+    <div class="step {{ 'done' if rv.reviewed > 0 else ('current' if overview.completed_scans > 0 else '') }}">
+      <div class="n">{{ '✓' if rv.reviewed > 0 else '3' }}</div>
+      <h3>审核并生成删除清单</h3>
+      <p>逐组确认保留哪一份；审核完成后生成清单，再到 NAS 上手动删除。</p>
+      <a class="button" href="/review">去审核重复文件</a>
+    </div>
+  </div>
 </div>
-
-{% if pending > 0 %}
-<div class="notice">有 <strong>{{ pending }}</strong> 组重复文件等待审核。建议从「内容重复」开始，这类文件内容完全一致，判断最可靠。</div>
-{% endif %}
 
 {% if overview.last_scan %}
 <div class="card">
-  <h2>最近一次扫描</h2>
-  <p>
+  <h2>最近一次扫描 <a class="more" href="/scans">全部扫描任务 →</a></h2>
+  <p style="margin-top:0">
     任务 #{{ overview.last_scan.id }} ·
     <span class="pill {{ overview.last_scan.status }}">{{ status_text.get(overview.last_scan.status, overview.last_scan.status) }}</span>
     · 当前阶段：{{ phase_text.get(overview.last_scan.phase, overview.last_scan.phase) }}
@@ -60,11 +128,11 @@
     已看到文件 {{ overview.last_scan.stats.files_indexed or 0 }} 个 · 目录 {{ overview.last_scan.dirs_seen or 0 }} 个 ·
     已计算哈希 {{ overview.last_scan.stats.hashes_computed or 0 }} 个
   </p>
-  {% if overview.last_scan.incomplete_reason %}<p class="warn">{{ overview.last_scan.incomplete_reason }}</p>{% endif %}
-  {% if overview.last_scan.error %}<p class="error">{{ overview.last_scan.error }}</p>{% endif %}
+  {% if overview.last_scan.incomplete_reason %}<p class="warn">⚠️ {{ overview.last_scan.incomplete_reason }}</p>{% endif %}
+  {% if overview.last_scan.error %}<p class="error">❌ {{ overview.last_scan.error }}</p>{% endif %}
   <div class="row">
     <a class="button" href="/scans">查看扫描进度</a>
-    {% if overview.review.total_groups > 0 %}<a class="button primary" href="/review">去审核</a>{% endif %}
+    {% if rv.total_groups > 0 %}<a class="button primary" href="/review">去审核</a>{% endif %}
   </div>
 </div>
 {% else %}

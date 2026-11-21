@@ -459,7 +459,12 @@ def test_all_pages_render_after_scan(client, db, root):
                  "/delete-plans", "/settings", "/notifications"):
         resp = client.get(path)
         assert resp.status_code == 200, f"{path}: {resp.status_code} {resp.text[:400]}"
-    assert "开始使用" in client.get("/").text
+    index = client.get("/").text
+    assert "开始使用" in index
+    # 迭代 7 UI 改版：纵向侧边栏 + KPI 卡片 + 建议卡
+    assert 'class="sidebar"' in index
+    assert "kpi-grid" in index
+    assert "优化建议" in index
     assert "怎么用" in client.get("/delete-plans").text
 
 

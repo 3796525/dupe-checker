@@ -7,25 +7,77 @@
 <link rel="stylesheet" href="/static/app.css">
 <meta name="csrf" content="{{ csrf or '' }}">
 </head>
-<body>
-<header class="topbar">
-  <a class="brand" href="/">🔍 重复文件核查器 <span class="badge">只读</span></a>
-  <nav>
-    <a href="/" class="{{ 'active' if nav == 'index' }}">概览</a>
-    <a href="/roots" class="{{ 'active' if nav == 'roots' }}">可扫描目录</a>
-    <a href="/plans" class="{{ 'active' if nav == 'plans' }}">扫描方案</a>
-    <a href="/scans" class="{{ 'active' if nav == 'scans' }}">扫描任务</a>
-    <a href="/review" class="{{ 'active' if nav == 'review' }}">审核重复</a>
-    <a href="/delete-plans" class="{{ 'active' if nav in ('delete_plans','delete_plan') }}">删除清单</a>
-    <a href="/notifications" class="{{ 'active' if nav == 'notifications' }}">消息</a>
-    <a href="/settings" class="{{ 'active' if nav == 'settings' }}">设置</a>
+<body class="layout">
+<button class="scrim" id="scrim" type="button" aria-label="关闭菜单" onclick="toggleNav(false)"></button>
+<aside class="sidebar" id="sidebar">
+  <a class="side-brand" href="/">
+    <span class="logo">🔍</span>
+    <span class="brand-text">
+      <strong>重复文件核查器</strong>
+      <small>NAS 去重 · 只读</small>
+    </span>
+  </a>
+
+  <div class="side-group-label">核查</div>
+  <nav class="side-nav">
+    <a href="/" class="{{ 'active' if nav == 'index' }}"><span class="ico">📊</span>概览</a>
+    <a href="/roots" class="{{ 'active' if nav == 'roots' }}"><span class="ico">📁</span>可扫描目录</a>
+    <a href="/plans" class="{{ 'active' if nav == 'plans' }}"><span class="ico">🗂️</span>扫描方案</a>
+    <a href="/scans" class="{{ 'active' if nav == 'scans' }}"><span class="ico">🔄</span>扫描任务</a>
+    <a href="/review" class="{{ 'active' if nav == 'review' }}"><span class="ico">✅</span>审核重复</a>
   </nav>
-</header>
-<main>
-{% block content %}{% endblock %}
-</main>
-<footer class="foot">dupe-checker v{{ version }} · 全程只读扫描 · 本工具不会删除、移动或修改任何文件</footer>
+
+  <div class="side-group-label">输出</div>
+  <nav class="side-nav">
+    <a href="/delete-plans" class="{{ 'active' if nav in ('delete_plans','delete_plan') }}"><span class="ico">📄</span>删除清单</a>
+  </nav>
+
+  <div class="side-group-label">系统</div>
+  <nav class="side-nav">
+    <a href="/notifications" class="{{ 'active' if nav == 'notifications' }}"><span class="ico">🔔</span>消息</a>
+    <a href="/settings" class="{{ 'active' if nav == 'settings' }}"><span class="ico">⚙️</span>设置</a>
+  </nav>
+
+  <div class="side-foot">
+    <div class="readonly-chip" title="所有扫描目录都以只读方式挂载">
+      <span class="dot"></span>只读模式 · 不会删除文件
+    </div>
+    <div class="side-foot-row">
+      <span class="version">v{{ version }}</span>
+      <button class="linklike" type="button" onclick="doLogout()">退出登录</button>
+    </div>
+  </div>
+</aside>
+
+<div class="content">
+  <div class="content-top">
+    <button class="menu-toggle" type="button" onclick="toggleNav(true)" aria-label="打开菜单">☰</button>
+    <span class="top-note">🔒 全程只读扫描 · 删除由你本人在 NAS 上完成</span>
+    <span class="top-spacer"></span>
+    <span class="top-user">已登录</span>
+  </div>
+  <main>
+  {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">dupe-checker v{{ version }} · 全程只读扫描 · 本工具不会删除、移动或修改任何文件</footer>
+</div>
+
 <script src="/static/app.js"></script>
+<script>
+function toggleNav(open) {
+  document.body.classList.toggle('sidebar-open', open === true);
+}
+async function doLogout() {
+  if (!confirm('确定退出登录？退出后需要口令重新登录。')) return;
+  const res = await api('POST', '/api/v1/auth/logout', {});
+  if (res.ok || res.status === 401) {
+    location.href = '/login';
+  } else {
+    alert('退出失败：' + ((res.data && res.data.error && res.data.error.message) || res.status));
+  }
+}
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') toggleNav(false); });
+</script>
 {% block scripts %}{% endblock %}
 </body>
 </html>
