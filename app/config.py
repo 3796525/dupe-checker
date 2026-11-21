@@ -47,7 +47,7 @@ class Config:
         self.guard_interval_seconds = max(60, int(_env("GUARD_INTERVAL_SECONDS", "1800")))
         self.guard_sample_limit = max(0, int(_env("GUARD_SAMPLE_LIMIT", "20")))
         self.guard_max_depth = max(1, int(_env("GUARD_MAX_DEPTH", "3")))
-        self.version = "0.1.7"
+        self.version = "0.1.8"
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.db_path.parent, self.export_dir, self.log_dir):
