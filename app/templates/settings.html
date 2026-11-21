@@ -34,6 +34,31 @@
 </div>
 
 <div class="card">
+  <h2>运行日志</h2>
+  <p class="muted small">应用日志同时写到容器标准输出和日志目录。这里只列出并读取白名单日志文件，不会暴露任意路径。</p>
+  <p><a class="button" href="/api/v1/system/logs?limit=200" target="_blank" rel="noopener">查看最近日志（JSON）</a></p>
+  {% if log_files %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>文件</th><th>大小</th><th>最近更新</th><th></th></tr></thead>
+    <tbody>
+    {% for f in log_files %}
+    <tr>
+      <td class="mono small">{{ f.name }}</td>
+      <td>{{ f.size | bytes }}</td>
+      <td class="small">{{ f.mtime }}</td>
+      <td><a class="button" href="/api/v1/system/logs/download?name={{ f.name | urlencode }}">下载</a></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted small">暂无日志文件（日志目录可能尚未写入）。</p>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>审核默认策略</h2>
   <form id="set-form" class="form-grid">
     <label>默认建议保留

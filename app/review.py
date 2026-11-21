@@ -136,6 +136,38 @@ def _path_missing(path: str | None) -> bool:
         return True
 
 
+def _like_escape(value: str) -> str:
+    """Escape LIKE wildcards so a user filter is matched literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _normalise_dir(value: str | None) -> str | None:
+    """Turn a directory filter into a literal LIKE prefix fragment."""
+    if value is None:
+        return None
+    text = value.strip().replace("\\", "/")
+    text = text.strip("/")
+    if not text:
+        return None
+    return _like_escape(text)
+
+
+def _normalise_ext(value: str | None) -> str | None:
+    """Normalise an extension filter such as png / .PNG to a lower-case suffix."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text.startswith("*."):
+        text = text[1:]
+    if not text.startswith("."):
+        text = "." + text
+    if text in (".", "*", ".*"):
+        return None
+    return _like_escape(text)
+
+
 def list_groups(
     db: Database,
     kind: str | None = None,
@@ -144,6 +176,8 @@ def list_groups(
     min_size: int | None = None,
     cursor: int = 0,
     limit: int = 50,
+    dir_prefix: str | None = None,
+    ext: str | None = None,
 ) -> dict:
     limit = max(1, min(200, limit))
     sql = [
@@ -174,6 +208,21 @@ def list_groups(
     if min_size:
         sql.append("AND EXISTS (SELECT 1 FROM review_items y WHERE y.group_id=g.id AND y.size>=?)")
         params.append(min_size)
+    # DEF-07: directory prefix (any member inside it) and extension match.
+    dir_fragment = _normalise_dir(dir_prefix)
+    if dir_fragment:
+        sql.append(
+            "AND EXISTS (SELECT 1 FROM review_items d WHERE d.group_id=g.id "
+            "AND d.path LIKE ? ESCAPE '\\')"
+        )
+        params.append(f"%/{dir_fragment}/%")
+    ext_fragment = _normalise_ext(ext)
+    if ext_fragment:
+        sql.append(
+            "AND EXISTS (SELECT 1 FROM review_items x2 WHERE x2.group_id=g.id "
+            "AND lower(x2.path) LIKE ? ESCAPE '\\')"
+        )
+        params.append(f"%{ext_fragment}")
     if cursor:
         sql.append("AND g.id>?")
         params.append(cursor)
@@ -196,6 +245,7 @@ def list_groups(
                 "min_size": r["min_size"],
                 "decided_count": r["decided_count"],
                 "sample_path": r["sample_path"],
+                "sample_dir": os.path.dirname(r["sample_path"]) if r["sample_path"] else "",
                 "keep_path": r["keep_path"],
                 # Cheap spot check (2 stats per row) so the list can flag
                 # groups whose files were deleted outside the tool.
@@ -217,17 +267,26 @@ def group_detail(db: Database, group_id: int) -> dict | None:
         "WHERE i.group_id=? ORDER BY i.mtime_ns ASC, i.path ASC",
         (group_id,),
     )
-    items = [
-        {
-            "id": i["id"],
-            "path": i["path"],
-            "size": i["size"],
-            "mtime_ns": i["mtime_ns"],
-            "decision": i["decision"],
-            "sha256": i["sha256"],
-        }
-        for i in rows
-    ]
+    items = []
+    for i in rows:
+        # DEF-05: nlink > 1 means deleting this path alone frees no space,
+        # which the reviewer must see before planning a deletion.
+        try:
+            nlink = os.stat(i["path"], follow_symlinks=False).st_nlink
+        except OSError:
+            nlink = None
+        items.append(
+            {
+                "id": i["id"],
+                "path": i["path"],
+                "dir": os.path.dirname(i["path"]),
+                "nlink": nlink,
+                "size": i["size"],
+                "mtime_ns": i["mtime_ns"],
+                "decision": i["decision"],
+                "sha256": i["sha256"],
+            }
+        )
     hashes = {i["sha256"] for i in items if i["sha256"]}
     same_content = bool(items) and all(i["sha256"] for i in items) and len(hashes) == 1
     return {

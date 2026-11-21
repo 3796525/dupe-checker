@@ -2,6 +2,7 @@
 {% block title %}扫描任务 · 重复文件核查器{% endblock %}
 {% block content %}
 <h1>扫描任务</h1>
+{% set reason_text = {'symlink': '符号链接', 'special': '特殊文件', 'permission': '没有读取权限', 'stat_error': '无法读取文件信息'} %}
 <p class="page-sub">扫描分三步：先记录文件信息，再比对内容，最后整理出重复分组。同一时间只运行一个任务，可暂停后从断点继续。</p>
 
 {% if current %}
@@ -24,12 +25,23 @@
   <p class="muted small" id="progress-text">
     {% if baseline %}已处理约 {{ ((current.stats.files_indexed or 0) / baseline * 100) | round(0) | int }}%（参考上次扫描的 {{ baseline }} 个文件）{% else %}首次扫描，暂时无法估算总进度；下方数字会实时更新。{% endif %}
   </p>
+  {% if current.incomplete_reason %}
+  <p class="warn small">⚠ 本次扫描可能不完整：{{ current.incomplete_reason }}
+    （已记录安全通知，<a href="/notifications">查看通知</a> 并检查挂载与权限）</p>
+  {% endif %}
   <dl class="kv">
     <div><dt>已扫描文件</dt><dd id="live-files">{{ current.stats.files_indexed or 0 }}</dd></div>
     <div><dt>已扫描目录</dt><dd id="live-dirs">{{ current.dirs_seen or 0 }}</dd></div>
     <div><dt>已计算哈希</dt><dd id="live-hashes">{{ current.stats.hashes_computed or 0 }}</dd></div>
+    <div><dt>已跳过（无法比对）</dt><dd id="live-skipped">{{ (current.stats.skipped or {}).get('count', 0) }}</dd></div>
     <div><dt>当前阶段</dt><dd id="live-phase">{{ phase_text.get(current.phase, current.phase) }}</dd></div>
   </dl>
+  {% set live_skip = current.stats.skipped or {} %}
+  <p class="muted small" id="live-skip-detail">
+    {% if live_skip.count %}跳过原因：
+      {% for reason, rc in (live_skip.by_reason or {}).items() if rc %}{{ reason_text.get(reason, reason) }} {{ rc }}{% if not loop.last %} · {% endif %}{% endfor %}
+      —— 这些文件不会被当作重复项比较{% endif %}
+  </p>
   <div class="row">
     {% if current.status == 'running' %}
     <button onclick="ctrl({{ current.id }},'pause')">暂停</button>
@@ -46,14 +58,15 @@
 {% if runs %}
 <div class="table-wrap">
 <table>
-<thead><tr><th>#</th><th>状态</th><th>阶段</th><th>开始</th><th>结束</th><th>文件</th><th>目录</th><th>哈希</th><th>操作</th></tr></thead>
+<thead><tr><th>#</th><th>状态</th><th>阶段</th><th>开始</th><th>结束</th><th>文件</th><th>目录</th><th>哈希</th><th>跳过</th><th>操作</th></tr></thead>
 <tbody>
 {% for r in runs %}
 <tr>
   <td>{{ r.id }}</td>
   <td>
     <span class="pill {{ r.status }}">{{ r.status_text }}</span>
-    {% if r.incomplete_reason %}<div class="warn small">{{ r.incomplete_reason }}</div>{% endif %}
+    {% if r.incomplete_reason %}<div class="warn small">⚠ 扫描不完整：{{ r.incomplete_reason }}
+      <a href="/notifications">查看通知</a></div>{% endif %}
     {% if r.error %}<div class="error small">{{ r.error }}</div>{% endif %}
   </td>
   <td>{{ r.phase_text }}</td>
@@ -62,6 +75,26 @@
   <td>{{ r.stats.files_indexed or 0 }}</td>
   <td>{{ r.dirs_seen or 0 }}</td>
   <td>{{ r.stats.hashes_computed or 0 }}</td>
+  <td>
+    {% set sk = r.stats.skipped or {} %}
+    {% set sk_count = sk.count or 0 %}
+    {% if sk_count %}
+    <span class="warn">{{ sk_count }}</span>
+    <details>
+      <summary class="small muted">明细</summary>
+      <ul class="small muted">
+        {% for reason, rc in (sk.by_reason or {}).items() if rc %}
+        <li>{{ reason_text.get(reason, reason) }}：{{ rc }}</li>
+        {% endfor %}
+      </ul>
+      {% if sk['items'] %}
+      <ul class="small muted">
+        {% for it in sk['items'][:20] %}<li>{{ it.path }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+    </details>
+    {% else %}0{% endif %}
+  </td>
   <td>
     {% if r.status == 'running' %}<button onclick="ctrl({{ r.id }},'pause')">暂停</button>
     <button class="danger" onclick="ctrl({{ r.id }},'cancel')">取消</button>{% endif %}
@@ -107,6 +140,8 @@ if (card) {
     document.getElementById('live-files').textContent = fmt(stats.files_indexed);
     document.getElementById('live-dirs').textContent = fmt(cur.dirs_seen);
     document.getElementById('live-hashes').textContent = fmt(stats.hashes_computed);
+    const skipEl = document.getElementById('live-skipped');
+    if (skipEl) skipEl.textContent = fmt((stats.skipped || {}).count);
     const phaseNames = {walk: '扫描目录和文件', hash: '比对文件内容', group: '整理重复分组', done: '已完成'};
     document.getElementById('live-phase').textContent = phaseNames[cur.phase] || cur.phase;
     document.querySelectorAll('.phase-steps span').forEach((el, i) => {

@@ -10,6 +10,7 @@ Design constraints (see docs/03-tech design):
 """
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -27,6 +28,7 @@ SAMPLE_BYTES = 4096
 HASH_CHUNK = 1024 * 1024
 BATCH_FILES = 500
 ERROR_LIMIT = 50
+SKIPPED_ITEM_LIMIT = 200
 
 
 class RateLimiter:
@@ -195,6 +197,14 @@ class Scanner:
         stats = {
             "files_seen": 0, "files_indexed": 0, "hashes_computed": 0,
             "bytes_hashed": 0, "dirs_scanned": 0, "errors": [],
+            # DEF-03: why a path never joined the duplicate comparison. Kept in
+            # the run stats so the scan detail page and /scans/{id} can answer
+            # "why is this file absent from the duplicate result?".
+            "skipped": {
+                "count": 0,
+                "by_reason": {"symlink": 0, "special": 0, "permission": 0, "stat_error": 0},
+                "items": [],
+            },
         }
         meta_limiter = RateLimiter(rate_meta)
         hash_limiter = RateLimiter(rate_hash * 1024 * 1024)
@@ -205,6 +215,7 @@ class Scanner:
         self._update_stats(run_id, stats, "hash", stats["dirs_scanned"])
 
         self._hash_candidates(run_id, hash_limiter, window, stats)
+        _notify_permission_skips(self.db, stats)
         self._check_state(run_id)
         self._update_stats(run_id, stats, "group", stats["dirs_scanned"])
 
@@ -246,6 +257,12 @@ class Scanner:
                     entries = list(os.scandir(dirpath))
                 except OSError as exc:
                     _record_error(stats, f"{dirpath}: {exc.strerror}")
+                    # An unreadable directory means everything below it is
+                    # invisible to this run: record the reason once (DEF-03).
+                    _record_skip(
+                        stats, dirpath,
+                        "permission" if _is_permission_error(exc) else "stat_error",
+                    )
                     continue
                 seen_dirs.add(dirpath)
                 stats["dirs_scanned"] += 1
@@ -254,6 +271,7 @@ class Scanner:
                         st = entry.stat(follow_symlinks=False)
                     except OSError as exc:
                         _record_error(stats, f"{entry.path}: {exc.strerror}")
+                        _record_skip(stats, entry.path, "stat_error")
                         continue
                     rel = os.path.relpath(entry.path, base)
                     if _excluded(rel, exclude):
@@ -264,7 +282,14 @@ class Scanner:
                         stack.append(entry.path)
                         continue
                     if not statmod.S_ISREG(st.st_mode):
-                        continue  # symlinks, sockets, devices are never followed
+                        # Never followed (FR-013): record why this path was
+                        # skipped instead of silently dropping it (DEF-03).
+                        _record_skip(
+                            stats,
+                            entry.path,
+                            "symlink" if statmod.S_ISLNK(st.st_mode) else "special",
+                        )
+                        continue
                     limiter.consume(1)
                     self._upsert_file(st, entry.path, entry.name, root["id"], gen)
                     stats["files_seen"] += 1
@@ -338,9 +363,20 @@ class Scanner:
             for row in stale:
                 path = row["path"]
                 rel = os.path.relpath(path, base)
-                if _excluded(rel, exclude):
-                    continue
+                # Data outside this plan's include scope belongs to other
+                # plans/views: never expire it (a scoped plan stays scoped).
                 if include and not _included(rel, include):
+                    continue
+                if exclude and _excluded_with_ancestors(rel, exclude):
+                    # DEF-01: a path excluded by the *current* plan must leave
+                    # the visible index, otherwise review/statistics keep
+                    # suggesting deletions inside directories the user has
+                    # explicitly excluded (FR-007). Ancestors count too because
+                    # the walk never descends into an excluded directory.
+                    db.execute(
+                        "DELETE FROM file_paths WHERE dev=? AND ino=? AND path=?",
+                        (row["dev"], row["ino"], path),
+                    )
                     continue
                 parent = os.path.dirname(path)
                 if parent in seen_dirs or not os.path.isdir(parent):
@@ -360,11 +396,20 @@ class Scanner:
         prev_total = sum(counts.get(k, 0) for k in new_counts)
         new_total = sum(new_counts.values())
         if prev_total and not include and not exclude and new_total < prev_total * 0.8:
-            db.execute(
+            reason = "本次扫描目录数比上次少 20% 以上，可能挂载或权限异常"
+            cur = db.execute(
                 "UPDATE scan_runs SET incomplete_reason=? WHERE seen_gen=?",
-                ("本次扫描目录数比上次少 20% 以上，可能挂载或权限异常", gen),
+                (reason, gen),
             )
             db.commit()
+            if cur.rowcount:
+                # DEF-04: an abnormal directory drop must reach the
+                # notification centre (and audit log), not just the run row --
+                # otherwise the user keeps reviewing an incomplete result
+                # without knowing the mount/permission problem exists (FR-015).
+                detail = f"{reason}（本次 {new_total} 个目录，上次 {prev_total} 个）"
+                db.notify("security", "扫描不完整，请检查挂载/权限", detail)
+                db.audit("system", "scan.incomplete", detail)
         counts.update(new_counts)
         db.set_setting("dir_counts_json", json.dumps(counts))
 
@@ -423,7 +468,7 @@ class Scanner:
                     stats["bytes_hashed"] += nbytes
                     sample_groups.setdefault(digest, []).append((m, path))
                 except OSError as exc:
-                    _record_error(stats, f"{path}: {exc.strerror}")
+                    _record_skip_or_error(stats, path, exc)
             db.commit()
             for digest, items in sample_groups.items():
                 if len(items) < 2:
@@ -433,7 +478,7 @@ class Scanner:
                     try:
                         full, nbytes = _sha256_file(path, limiter)
                     except OSError as exc:
-                        _record_error(stats, f"{path}: {exc.strerror}")
+                        _record_skip_or_error(stats, path, exc)
                         continue
                     limiter.consume(nbytes)
                     stats["bytes_hashed"] += nbytes
@@ -462,7 +507,7 @@ class Scanner:
             try:
                 full, nbytes = _sha256_file(path, limiter)
             except OSError as exc:
-                _record_error(stats, f"{path}: {exc.strerror}")
+                _record_skip_or_error(stats, path, exc)
                 continue
             limiter.consume(nbytes)
             stats["bytes_hashed"] += nbytes
@@ -537,10 +582,80 @@ def _included(rel: str, globs: list[str]) -> bool:
     )
 
 
+def _excluded_with_ancestors(rel: str, globs: list[str]) -> bool:
+    """True when rel (or any of its parent directories) matches an exclude glob.
+
+    The walk stops at any excluded entry, so the whole subtree below an excluded
+    directory is invisible to the run too. Cleanup must use the same notion as
+    discovery, otherwise excluding a directory name leaves its children in the
+    index forever (DEF-01).
+    """
+    if not globs:
+        return False
+    if _excluded(rel, globs):
+        return True
+    parts = rel.split(os.sep)
+    for index in range(1, len(parts)):
+        if _excluded(os.sep.join(parts[:index]), globs):
+            return True
+    return False
+
+
 def _record_error(stats: dict, message: str) -> None:
     errors = stats.setdefault("errors", [])
     if len(errors) < ERROR_LIMIT:
         errors.append(message)
+
+
+def _is_permission_error(exc: OSError) -> bool:
+    """EACCES/EPERM: the path exists but this process may not read it."""
+    return exc.errno in (errno.EACCES, errno.EPERM)
+
+
+def _record_skip(stats: dict, path: str, reason: str) -> None:
+    """Track why a path never joined the duplicate comparison (DEF-03, FR-013).
+
+    Counts stay complete; only the item list is capped so a root full of
+    symlinks cannot inflate the scan_runs stats row.
+    """
+    skipped = stats.setdefault(
+        "skipped",
+        {
+            "count": 0,
+            "by_reason": {"symlink": 0, "special": 0, "permission": 0, "stat_error": 0},
+            "items": [],
+        },
+    )
+    skipped["count"] = int(skipped.get("count") or 0) + 1
+    by_reason = skipped.setdefault("by_reason", {})
+    by_reason[reason] = int(by_reason.get(reason) or 0) + 1
+    items = skipped.setdefault("items", [])
+    if len(items) < SKIPPED_ITEM_LIMIT:
+        items.append({"path": path, "reason": reason})
+
+
+def _record_skip_or_error(stats: dict, path: str, exc: OSError) -> None:
+    """Permission problems are a skip (the file stays indexed and visible to the
+    user); any other OS error keeps the pre-existing error-list behaviour.
+    """
+    if _is_permission_error(exc):
+        _record_skip(stats, path, "permission")
+    else:
+        _record_error(stats, f"{path}: {exc.strerror}")
+
+
+def _notify_permission_skips(db: Database, stats: dict) -> None:
+    """One aggregate security notification per run (never one per file)."""
+    reason_counts = (stats.get("skipped") or {}).get("by_reason") or {}
+    count = int(reason_counts.get("permission") or 0)
+    if not count:
+        return
+    db.notify(
+        "security",
+        "部分文件无法读取",
+        f"{count} 个文件/目录因权限不足未能读取内容，已跳过并记录在扫描详情中；"
+        "查重结果可能不完整，请检查挂载与文件权限。",
+    )
 
 
 def _sample_hash(path: str) -> tuple[str, int]:

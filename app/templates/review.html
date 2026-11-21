@@ -19,8 +19,21 @@
   <a href="/review?kind=name&status=pending" class="{{ 'active' if kind == 'name' }}">同名候选</a>
 </div>
 
+<form class="row" method="get" action="/review" style="margin-bottom:12px">
+  <input type="hidden" name="kind" value="{{ kind }}">
+  <input type="hidden" name="status" value="{{ status }}">
+  <label class="small">所属目录
+    <input name="dir" value="{{ dir }}" placeholder="例如 photo/2024" autocomplete="off">
+  </label>
+  <label class="small">扩展名
+    <input name="ext" value="{{ ext }}" placeholder="例如 .jpg" autocomplete="off">
+  </label>
+  <button type="submit">筛选</button>
+  {% if dir or ext %}<a class="button" href="/review?kind={{ kind }}&status={{ status }}">清除筛选</a>{% endif %}
+</form>
+
 <div class="row">
-  <span class="muted small">共 {{ stats.total_groups }} 组 · 待审核 {{ stats.by_status.get('pending', 0) }} 组 · 已审核 {{ stats.by_status.get('reviewed', 0) }} 组</span>
+  <span class="muted small">共 {{ stats.total_groups }} 组 · 待审核 {{ stats.by_status.get('pending', 0) }} 组 · 已审核 {{ stats.by_status.get('reviewed', 0) }} 组{% if dir %} · 目录：{{ dir }}{% endif %}{% if ext %} · 扩展名：{{ ext }}{% endif %}</span>
   <span class="spacer"></span>
   <a class="button" href="/review?kind={{ kind }}&status=">全部</a>
   <a class="button" href="/review?kind={{ kind }}&status=pending">待审核</a>
@@ -67,11 +80,13 @@
 </tbody>
 </table>
 </div>
-{% if next_cursor %}<a class="button" href="/review?kind={{ kind }}&status={{ status }}&cursor={{ next_cursor }}">下一页 →</a>{% endif %}
+{% if next_cursor %}<a class="button" href="/review?kind={{ kind }}&status={{ status }}&dir={{ dir | urlencode }}&ext={{ ext | urlencode }}&cursor={{ next_cursor }}">下一页 →</a>{% endif %}
 {% else %}
 <div class="card empty">
   <h2>没有符合条件的重复组</h2>
-  {% if status == 'pending' %}
+  {% if dir or ext %}
+  <p>当前有目录/扩展名筛选，试着放宽筛选条件或清除筛选。</p>
+  {% elif status == 'pending' %}
   <p>可能还没有扫描，或者所有组都已审核完。</p>
   {% else %}
   <p>这个状态下暂时没有分组，换个筛选条件看看。</p>

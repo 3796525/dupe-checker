@@ -11,7 +11,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import stat as statmod
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -138,23 +141,6 @@ def _require_api(request: Request) -> dict:
     return sess
 
 
-def _root_paths() -> list[str]:
-    rows = db.query("SELECT mount_path FROM scan_roots WHERE enabled=1")
-    return [r["mount_path"] for r in rows]
-
-
-def _validate_path(path: str) -> str:
-    """Reject any path outside the configured read-only roots."""
-    real = os.path.realpath(path)
-    for root in _root_paths():
-        root_real = os.path.realpath(root)
-        if real == root_real or real.startswith(root_real + os.sep):
-            return real
-    raise HTTPException(
-        status_code=403, detail={"code": "FORBIDDEN_PATH", "message": "路径不在已授权目录内"}
-    )
-
-
 def _page(request: Request, template: str, **ctx):
     ctx.setdefault("request", request)
     ctx.setdefault("version", config.version)
@@ -178,6 +164,438 @@ def _json_error(code: str, message: str, status: int, details: dict | None = Non
     return JSONResponse(
         {"error": {"code": code, "message": message, "details": details or {}}}, status_code=status
     )
+
+
+# ---------------------------------------------------------------------------
+# request hardening (DEF-01..DEF-06, DEF-11, DEF-12)
+# ---------------------------------------------------------------------------
+MAX_BODY_BYTES = 1024 * 1024  # 1 MiB: no endpoint accepts a larger JSON body
+SQLITE_INT_MAX = 2**63 - 1  # sqlite3 binds Python ints to signed 64 bit
+PASSWORD_MAX = 200
+PLAN_NAME_MAX = 200
+PLAN_NOTE_MAX = 2000
+KEEP_POLICIES = ("earliest_mtime", "longest_path")
+SETTINGS_INT_RANGES = {"rate_meta": (1, 2000), "rate_hash": (1, 1000)}
+# DEF-02: read-only glob preview budget. The walk never writes and stops early
+# instead of turning a preview click into a full NAS traversal.
+PREVIEW_MATCH_LIMIT = 200
+PREVIEW_ENTRY_LIMIT = 50000
+# DEF-06: in-app log viewer. Only these names (plus midnight-rotation backups)
+# may ever be read or downloaded; anything else is a 404.
+LOG_FILE_BASE = "app.log"
+LOG_NAME_RE = re.compile(r"^(?:app|dupe)\.log(?:\.\d{4}-\d{2}-\d{2})?$")
+LOG_TAIL_BYTES = 256 * 1024
+LOG_LINE_MAX = 1000
+
+
+def _payload_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail={
+            "code": "PAYLOAD_TOO_LARGE",
+            "message": "请求体超过 1 MiB 上限",
+            "details": {"limit_bytes": MAX_BODY_BYTES},
+        },
+    )
+
+
+async def _read_body_limited(request: Request, max_bytes: int = MAX_BODY_BYTES) -> bytes:
+    """Read the request body, refusing to buffer more than *max_bytes*.
+
+    DEF-04: a declared Content-Length is checked before reading, and the
+    streamed body is counted as it arrives so a lying/absent Content-Length
+    cannot bypass the limit.
+    """
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > max_bytes:
+                raise _payload_too_large()
+        except ValueError:
+            pass  # malformed header: fall back to counting the stream
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise _payload_too_large()
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def json_body(request: Request, *, required: bool = False) -> dict:
+    """Return the request body as a JSON object or raise a 4xx.
+
+    DEF-01/DEF-02: every endpoint that reads a JSON body goes through this
+    helper, so malformed JSON / a non-object body can never surface as a 500.
+    An empty body is allowed unless *required* is true.
+    """
+    raw = await _read_body_limited(request)
+    if not raw.strip():
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "VALIDATION_ERROR", "message": "请求体不能为空", "details": {}},
+            )
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "VALIDATION_ERROR", "message": "请求体不是合法的 JSON", "details": {}},
+        )
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "VALIDATION_ERROR", "message": "请求体必须是 JSON 对象", "details": {}},
+        )
+    return data
+
+
+def _check_path_id(value: int, label: str = "记录") -> int:
+    """Reject ids that sqlite3 cannot bind (DEF-03), as a normal 404."""
+    if value < 0 or value > SQLITE_INT_MAX:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": f"{label}不存在", "details": {}},
+        )
+    return value
+
+
+def _check_query_int(value: int, name: str, minimum: int = 0) -> int:
+    """Validate an integer query parameter before it reaches sqlite (DEF-03)."""
+    if value < minimum or value > SQLITE_INT_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{name} 超出允许范围",
+                "details": {"field": name},
+            },
+        )
+    return value
+
+
+def _clamp_limit(value: int, default: int, maximum: int = 200) -> int:
+    """Clamp a list limit into [1, maximum] (DEF-11)."""
+    if value < 1:
+        return 1
+    return min(value, maximum)
+
+
+def _glob_list(value: str | None) -> list[str]:
+    """The read-only array view of a stored comma-separated glob string."""
+    return scanner_mod._split_globs(value or "")
+
+
+def _preview_globs(roots, include_value: str, exclude_value: str) -> dict:
+    """Walk plan roots read-only and report what the current rules match.
+
+    DEF-02: this mirrors the scanner's walk semantics (exclude first, then
+    include, never follow symlinks) but writes nothing: no index rows, no
+    database writes, no filesystem writes. The walk is budgeted so one click
+    cannot turn into a full NAS traversal.
+    """
+    include = _glob_list(include_value)
+    exclude = _glob_list(exclude_value)
+    matched: list[dict] = []
+    total = 0
+    included = 0
+    excluded = 0
+    scanned = 0
+    truncated = False
+    for root in roots:
+        if truncated:
+            break
+        base = root["mount_path"]
+        stack = [base]
+        while stack and not truncated:
+            dirpath = stack.pop()
+            try:
+                entries = list(os.scandir(dirpath))
+            except OSError:
+                continue  # an unreadable directory is skipped, not an error
+            for entry in entries:
+                scanned += 1
+                if scanned > PREVIEW_ENTRY_LIMIT:
+                    truncated = True
+                    break
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                rel = os.path.relpath(entry.path, base)
+                if scanner_mod._excluded(rel, exclude):
+                    excluded += 1
+                    continue
+                if include and not scanner_mod._included(rel, include):
+                    continue
+                is_dir = statmod.S_ISDIR(st.st_mode)
+                total += 1
+                if not is_dir:
+                    included += 1
+                if len(matched) < PREVIEW_MATCH_LIMIT:
+                    matched.append(
+                        {
+                            "path": entry.path,
+                            "size": 0 if is_dir else st.st_size,
+                            "is_dir": is_dir,
+                        }
+                    )
+                if is_dir:
+                    stack.append(entry.path)
+    return {
+        "matched": matched,
+        "total": total,
+        "included": included,
+        "excluded": excluded,
+        "scanned": scanned,
+        "truncated": truncated,
+        "limit": PREVIEW_MATCH_LIMIT,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DEF-06: in-app log viewing (whitelisted files only, bounded tail reads)
+# ---------------------------------------------------------------------------
+def _log_files() -> list[dict]:
+    """List whitelisted files in LOG_DIR (rotation backups included)."""
+    try:
+        entries = list(config.log_dir.iterdir())
+    except OSError:
+        return []
+    files: list[dict] = []
+    for path in entries:
+        if not LOG_NAME_RE.match(path.name):
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if not statmod.S_ISREG(st.st_mode):
+            continue
+        files.append(
+            {
+                "name": path.name,
+                "size": st.st_size,
+                "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    files.sort(key=lambda item: item["name"])
+    return files
+
+
+def _resolve_log_path(name: object) -> Path | None:
+    """Return a whitelisted log file, or None.
+
+    Only an exact whitelisted name (optionally with a rotation date suffix) is
+    accepted, so traversal sequences such as ../ can never resolve to a file;
+    the resolved parent is re-checked against LOG_DIR as defence in depth.
+    """
+    if not isinstance(name, str) or not LOG_NAME_RE.match(name):
+        return None
+    directory = config.log_dir.resolve()
+    try:
+        candidate = (directory / name).resolve()
+    except OSError:
+        return None
+    if candidate.parent != directory or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _read_log_tail(path: Path, limit: int) -> tuple[list[str], bool]:
+    """Read at most LOG_TAIL_BYTES from the end of *path* (never unbounded)."""
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        if size > LOG_TAIL_BYTES:
+            fh.seek(size - LOG_TAIL_BYTES)
+        raw = fh.read(LOG_TAIL_BYTES)
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    truncated = size > LOG_TAIL_BYTES
+    if len(lines) > limit:
+        lines = lines[-limit:]
+        truncated = True
+    return lines, truncated
+
+
+def _setup_file_logging():
+    """Write app.log under LOG_DIR while keeping stdout/stderr logging.
+
+    Called once at startup after basicConfig (so the stream handler stays).
+    Returns the handler, or None when LOG_DIR is not writable: logging must
+    never take the service down.
+    """
+    try:
+        config.log_dir.mkdir(parents=True, exist_ok=True)
+        root = logging.getLogger()
+        for handler in root.handlers:
+            if getattr(handler, "_dupe_log_file", False):
+                return handler
+        handler = TimedRotatingFileHandler(
+            str(config.log_dir / LOG_FILE_BASE),
+            when="midnight",
+            backupCount=7,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        handler._dupe_log_file = True
+        root.addHandler(handler)
+        return handler
+    except OSError as exc:
+        log.warning("无法写入日志文件目录 %s: %s", config.log_dir, exc)
+        return None
+
+
+def _body_str(
+    body: dict,
+    key: str,
+    default: str = "",
+    *,
+    maximum: int | None = None,
+    label: str | None = None,
+) -> str:
+    value = body.get(key, default)
+    if value is None:
+        value = default
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{label or key}必须是字符串",
+                "details": {"field": key},
+            },
+        )
+    if maximum is not None and len(value) > maximum:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{label or key}长度不能超过 {maximum} 个字符",
+                "details": {"field": key},
+            },
+        )
+    return value
+
+
+def _body_int(
+    body: dict,
+    key: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int = SQLITE_INT_MAX,
+) -> int:
+    value = body.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{key} 必须是整数",
+                "details": {"field": key},
+            },
+        )
+    if value < minimum or value > maximum:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{key} 超出允许范围（{minimum}..{maximum}）",
+                "details": {"field": key},
+            },
+        )
+    return value
+
+
+def _body_obj(body: dict, key: str) -> dict:
+    value = body.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{key} 必须是 JSON 对象",
+                "details": {"field": key},
+            },
+        )
+    return value
+
+
+def _body_id_list(body: dict, key: str, label: str, default=None):
+    value = body.get(key, default)
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "VALIDATION_ERROR",
+                "message": f"{key} 必须是数组",
+                "details": {"field": key},
+            },
+        )
+    out: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0 or item > SQLITE_INT_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "VALIDATION_ERROR",
+                    "message": f"{key} 包含非法{label}",
+                    "details": {"field": key},
+                },
+            )
+        out.append(item)
+    return out
+
+
+def _valid_password(value) -> str | None:
+    """Return an error message for an unacceptable password, else None."""
+    if not isinstance(value, str):
+        return "口令必须是字符串"
+    if len(value) < 10:
+        return "口令至少 10 位"
+    if len(value) > PASSWORD_MAX:
+        return f"口令长度不能超过 {PASSWORD_MAX} 个字符"
+    return None
+
+
+def _guard_ok(guard: dict) -> bool:
+    return bool(guard.get("passed")) and not bool(guard.get("unsafe"))
+
+
+def _guard_status(guard: dict) -> str:
+    return "ok" if _guard_ok(guard) else "fatal"
+
+
+def _guard_public(guard: dict) -> dict:
+    """Path-free guard summary for anonymous health endpoints (DEF-07)."""
+    roots = guard.get("roots") or []
+    passed = 0
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        if (
+            root.get("exists")
+            and root.get("is_dir")
+            and root.get("readable")
+            and root.get("readonly")
+            and not root.get("nested_writable")
+        ):
+            passed += 1
+    return {
+        "passed": bool(guard.get("passed")),
+        "unsafe": bool(guard.get("unsafe")),
+        "roots_total": len(roots),
+        "roots_passed": passed,
+    }
 
 
 def _client_ip(request: Request) -> str:
@@ -262,6 +680,26 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse({"error": detail}, status_code=exc.status_code)
 
 
+# DEF-06: defence-in-depth headers on every response (pages, JSON and files).
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
+
+
 # ---------------------------------------------------------------------------
 # startup / scheduler
 # ---------------------------------------------------------------------------
@@ -281,6 +719,9 @@ def on_startup() -> None:
     global guard_report
     config.ensure_dirs()
     logging.basicConfig(level=logging.INFO)
+    # DEF-06: keep the stderr handler and add a rotating file under LOG_DIR so
+    # the in-app log viewer has something to show inside the container.
+    _setup_file_logging()
     guard_report = enforce_guard_or_exit()
     _init_setup_token()
     _bootstrap_roots()
@@ -302,11 +743,12 @@ def on_startup() -> None:
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> JSONResponse:
+    """Anonymous liveness probe: no internal paths or guard detail (DEF-07)."""
     guard = _guard_snapshot()
     return JSONResponse(
         {
-            "status": "ok" if guard.get("passed") and not guard.get("unsafe") else "fatal",
-            "guard": guard,
+            "status": _guard_status(guard),
+            "guard_passed": _guard_ok(guard),
             "version": config.version,
         }
     )
@@ -314,11 +756,12 @@ def health() -> JSONResponse:
 
 @app.get("/api/v1/system/health")
 def api_health() -> JSONResponse:
+    """Anonymous health details, with guard roots reduced to counts (DEF-07)."""
     guard = _guard_snapshot()
     return JSONResponse(
         {
-            "status": "ok" if guard.get("passed") and not guard.get("unsafe") else "fatal",
-            "guard": guard,
+            "status": _guard_status(guard),
+            "guard": _guard_public(guard),
             "db": {"ok": True, "schema_version": 1},
             "version": config.version,
         }
@@ -337,6 +780,34 @@ def api_guard(request: Request) -> dict:
     if data.get("roots"):
         return data
     return json.loads(db.get_setting("guard_report", "{}") or "{}") or data
+
+
+@app.get("/api/v1/system/logs")
+def api_logs(request: Request, name: str | None = None, limit: int = 200) -> dict:
+    """DEF-06: tail a whitelisted log file; names are never paths."""
+    _require_api(request)
+    limit = _clamp_limit(limit, 200, LOG_LINE_MAX)
+    files = _log_files()
+    if name is None:
+        names = [item["name"] for item in files]
+        name = LOG_FILE_BASE if LOG_FILE_BASE in names else (names[0] if names else None)
+    if name is None:
+        return {"files": files, "name": None, "lines": [], "truncated": False}
+    path = _resolve_log_path(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "日志文件不存在"})
+    lines, truncated = _read_log_tail(path, limit)
+    return {"files": files, "name": path.name, "lines": lines, "truncated": truncated}
+
+
+@app.get("/api/v1/system/logs/download")
+def api_log_download(request: Request, name: str = ""):
+    """DEF-06: download one whitelisted log file (never an arbitrary path)."""
+    _require_api(request)
+    path = _resolve_log_path(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "日志文件不存在"})
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=path.name)
 
 
 # ---------------------------------------------------------------------------
@@ -379,21 +850,19 @@ async def api_setup(request: Request):
     client = _client_ip(request)
     if setup_limiter.is_blocked(client):
         return _json_error("RATE_LIMITED", "初始化尝试过于频繁，请 60 秒后再试", 429)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    provided = str(body.get("token", ""))
+    body = await json_body(request, required=False)
+    provided = body.get("token", "")
+    if not isinstance(provided, str):
+        provided = ""
     if not setup_token_ok(load_setup_token(), provided):
         setup_limiter.record_failure(client)
         db.audit("user", "auth.setup_failed", client)
         # Deliberately vague: do not reveal whether a token exists/expired.
         return _json_error("SETUP_FORBIDDEN", "初始化令牌无效或已失效", 403)
-    password = str(body.get("password", ""))
-    if len(password) < 10:
-        return _json_error("VALIDATION_ERROR", "口令至少 10 位", 400)
+    password = body.get("password", "")
+    error = _valid_password(password)
+    if error:
+        return _json_error("VALIDATION_ERROR", error, 400)
     setup_limiter.reset(client)
     db.set_setting("password_hash", hash_password(password))
     clear_setup_token()
@@ -420,9 +889,20 @@ async def api_login(request: Request):
     client = request.client.host if request.client else "unknown"
     if limiter.is_blocked(client):
         return _json_error("RATE_LIMITED", "尝试过于频繁，请 60 秒后再试", 429)
-    body = await request.json()
+    try:
+        body = await json_body(request, required=True)
+    except HTTPException:
+        # Malformed bodies are a failed attempt: no free 5xx/log-flood path.
+        limiter.record_failure(client)
+        db.audit("user", "auth.login_bad_request", client)
+        raise
+    password = body.get("password", "")
     stored = db.get_setting("password_hash", "") or ""
-    if not verify_password(str(body.get("password", "")), stored):
+    if not isinstance(password, str):
+        limiter.record_failure(client)
+        db.audit("user", "auth.login_bad_request", client)
+        return _json_error("VALIDATION_ERROR", "口令必须是字符串", 400)
+    if not verify_password(password, stored):
         limiter.record_failure(client)
         db.audit("user", "auth.login_failed", client)
         return _json_error("AUTH_INVALID", "口令错误", 401)
@@ -467,9 +947,19 @@ def api_roots(request: Request) -> dict:
     return {"items": [{"id": r["id"], "path": r["mount_path"], "label": r["label"]} for r in rows]}
 
 
+def _dir_has_children(path: str) -> bool:
+    """Whether a directory has at least one entry (an OSError counts as empty)."""
+    try:
+        with os.scandir(path) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+
 @app.get("/api/v1/roots/tree")
 def api_tree(request: Request, root_id: int = 0) -> dict:
     _require_api(request)
+    _check_path_id(root_id, "目录")
     root = db.query_one("SELECT * FROM scan_roots WHERE id=? AND enabled=1", (root_id,))
     if root is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "目录不存在"})
@@ -477,7 +967,17 @@ def api_tree(request: Request, root_id: int = 0) -> dict:
     try:
         with os.scandir(root["mount_path"]) as it:
             for e in it:
-                entries.append({"name": e.name, "is_dir": e.is_dir(follow_symlinks=False)})
+                is_dir = e.is_dir(follow_symlinks=False)
+                entries.append(
+                    {
+                        "name": e.name,
+                        "path": e.path,
+                        # DEF-09: drilling down one level needs to know whether
+                        # a directory hides more entries (never a full walk).
+                        "is_dir": is_dir,
+                        "has_children": _dir_has_children(e.path) if is_dir else False,
+                    }
+                )
     except OSError as exc:
         raise HTTPException(
             status_code=403, detail={"code": "FORBIDDEN_PATH", "message": str(exc.strerror)}
@@ -493,6 +993,12 @@ def _plan_row(row) -> dict:
         "roots": json.loads(row["roots_json"] or "[]"),
         "include_globs": row["include_globs"],
         "exclude_globs": row["exclude_globs"],
+        # DEF-09: read-only array view; the stored/write contract stays a
+        # comma-separated string for backwards compatibility.
+        "globs": {
+            "include": _glob_list(row["include_globs"]),
+            "exclude": _glob_list(row["exclude_globs"]),
+        },
         "trigger_type": row["trigger_type"],
         "trigger": json.loads(row["trigger_json"] or "{}"),
         "rate_meta": row["rate_meta"],
@@ -508,19 +1014,27 @@ def api_plans(request: Request) -> dict:
     return {"items": [_plan_row(r) for r in db.query("SELECT * FROM scan_plans ORDER BY id")]}
 
 
-@app.post("/api/v1/plans")
+@app.post("/api/v1/plans", status_code=201)
 async def api_plan_create(request: Request) -> dict:
     _require_api(request)
-    body = await request.json()
-    name = str(body.get("name", "")).strip()
+    body = await json_body(request, required=True)
+    name = _body_str(body, "name", label="方案名", maximum=PLAN_NAME_MAX).strip()
     if not name:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "方案名必填"})
-    roots = body.get("root_ids") or [r["id"] for r in db.query("SELECT id FROM scan_roots WHERE enabled=1")]
+    roots = _body_id_list(body, "root_ids", "目录编号")
+    if not roots:
+        roots = [r["id"] for r in db.query("SELECT id FROM scan_roots WHERE enabled=1")]
     if not roots:
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "至少选择一个目录"})
-    trigger_type = body.get("trigger_type", "manual")
+    trigger_type = _body_str(body, "trigger_type", "manual", label="触发方式")
     if trigger_type not in ("manual", "daily", "weekly", "interval", "notify_only"):
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "无效触发方式"})
+    trigger = _body_obj(body, "trigger")
+    window = _body_obj(body, "window")
+    include_globs = _body_str(body, "include_globs", maximum=2000, label="包含规则")
+    exclude_globs = _body_str(body, "exclude_globs", maximum=2000, label="排除规则")
+    rate_meta = _body_int(body, "rate_meta", 2000, minimum=0)
+    rate_hash = _body_int(body, "rate_hash", 50, minimum=0)
     now = now_iso()
     db.execute(
         "INSERT INTO scan_plans(name, roots_json, include_globs, exclude_globs, trigger_type, "
@@ -529,13 +1043,13 @@ async def api_plan_create(request: Request) -> dict:
         (
             name,
             json.dumps(roots),
-            str(body.get("include_globs") or ""),
-            str(body.get("exclude_globs") or ""),
+            include_globs,
+            exclude_globs,
             trigger_type,
-            json.dumps(body.get("trigger") or {}),
-            int(body.get("rate_meta") or 2000),
-            int(body.get("rate_hash") or 50),
-            json.dumps(body.get("window") or {}),
+            json.dumps(trigger),
+            rate_meta,
+            rate_hash,
+            json.dumps(window),
             now,
             now,
         ),
@@ -549,21 +1063,53 @@ async def api_plan_create(request: Request) -> dict:
 @app.patch("/api/v1/plans/{plan_id}")
 async def api_plan_update(plan_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(plan_id, "方案")
     row = db.query_one("SELECT * FROM scan_plans WHERE id=?", (plan_id,))
     if row is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
-    body = await request.json()
+    body = await json_body(request, required=False)
+    target = dict(row)
+    if "name" in body:
+        target["name"] = _body_str(body, "name", label="方案名", maximum=PLAN_NAME_MAX).strip()
+        if not target["name"]:
+            raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "方案名必填"})
+    if "root_ids" in body:
+        target["roots_json"] = json.dumps(_body_id_list(body, "root_ids", "目录编号") or [])
+    if "include_globs" in body:
+        target["include_globs"] = _body_str(body, "include_globs", maximum=2000, label="包含规则")
+    if "exclude_globs" in body:
+        target["exclude_globs"] = _body_str(body, "exclude_globs", maximum=2000, label="排除规则")
+    if "trigger_type" in body:
+        target["trigger_type"] = _body_str(body, "trigger_type", label="触发方式")
+        if target["trigger_type"] not in ("manual", "daily", "weekly", "interval", "notify_only"):
+            raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "无效触发方式"})
+    if "trigger" in body:
+        target["trigger_json"] = json.dumps(_body_obj(body, "trigger"))
+    if "window" in body:
+        target["window_json"] = json.dumps(_body_obj(body, "window"))
+    if "rate_meta" in body:
+        target["rate_meta"] = _body_int(body, "rate_meta", 0, minimum=0)
+    if "rate_hash" in body:
+        target["rate_hash"] = _body_int(body, "rate_hash", 0, minimum=0)
+    if "enabled" in body:
+        enabled = body["enabled"]
+        if isinstance(enabled, bool):
+            target["enabled"] = 1 if enabled else 0
+        elif isinstance(enabled, int) and enabled in (0, 1):
+            target["enabled"] = enabled
+        else:
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "enabled 必须是布尔值", "details": {"field": "enabled"}})
     updates = {
-        "name": body.get("name", row["name"]),
-        "roots_json": json.dumps(body.get("root_ids", json.loads(row["roots_json"]))),
-        "include_globs": body.get("include_globs", row["include_globs"]),
-        "exclude_globs": body.get("exclude_globs", row["exclude_globs"]),
-        "trigger_type": body.get("trigger_type", row["trigger_type"]),
-        "trigger_json": json.dumps(body.get("trigger", json.loads(row["trigger_json"]))),
-        "rate_meta": body.get("rate_meta", row["rate_meta"]),
-        "rate_hash": body.get("rate_hash", row["rate_hash"]),
-        "window_json": json.dumps(body.get("window", json.loads(row["window_json"]))),
-        "enabled": int(body.get("enabled", row["enabled"])),
+        "name": target["name"],
+        "roots_json": target["roots_json"],
+        "include_globs": target["include_globs"],
+        "exclude_globs": target["exclude_globs"],
+        "trigger_type": target["trigger_type"],
+        "trigger_json": target["trigger_json"],
+        "rate_meta": target["rate_meta"],
+        "rate_hash": target["rate_hash"],
+        "window_json": target["window_json"],
+        "enabled": target["enabled"],
     }
     db.execute(
         "UPDATE scan_plans SET name=?, roots_json=?, include_globs=?, exclude_globs=?, "
@@ -581,9 +1127,50 @@ async def api_plan_update(plan_id: int, request: Request) -> dict:
     return _plan_row(db.query_one("SELECT * FROM scan_plans WHERE id=?", (plan_id,)))
 
 
+@app.post("/api/v1/plans/{plan_id}/test-globs")
+async def api_plan_test_globs(plan_id: int, request: Request) -> dict:
+    """DEF-02: read-only preview of what the plan's glob rules would match.
+
+    Nothing is written: no index rows, no plan mutations, no filesystem
+    changes. Guard-unsafe deployments refuse here just like scans/export.
+    """
+    _require_api(request)
+    _check_path_id(plan_id, "方案")
+    blocked = _guard_unsafe_response()
+    if blocked is not None:
+        return blocked
+    row = db.query_one("SELECT * FROM scan_plans WHERE id=?", (plan_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
+    body = await json_body(request, required=False)
+    include_value = row["include_globs"] or ""
+    exclude_value = row["exclude_globs"] or ""
+    # Optional overrides let the form preview unsaved rules; stored values win
+    # only when a field is absent.
+    if "include_globs" in body:
+        include_value = _body_str(body, "include_globs", maximum=2000, label="包含规则")
+    if "exclude_globs" in body:
+        exclude_value = _body_str(body, "exclude_globs", maximum=2000, label="排除规则")
+    roots = []
+    for rid in json.loads(row["roots_json"] or "[]"):
+        root = db.query_one("SELECT * FROM scan_roots WHERE id=? AND enabled=1", (rid,))
+        if root is not None:
+            roots.append(root)
+    if not roots:
+        # A plan without explicit roots scans every enabled root.
+        roots = db.query("SELECT * FROM scan_roots WHERE enabled=1 ORDER BY id")
+    preview = _preview_globs(roots, include_value, exclude_value)
+    preview["plan_id"] = plan_id
+    preview["roots"] = [root["mount_path"] for root in roots]
+    preview["include_globs"] = _glob_list(include_value)
+    preview["exclude_globs"] = _glob_list(exclude_value)
+    return preview
+
+
 @app.delete("/api/v1/plans/{plan_id}")
 def api_plan_delete(plan_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(plan_id, "方案")
     db.execute("DELETE FROM scan_plans WHERE id=?", (plan_id,))
     db.commit()
     return {"ok": True}
@@ -598,10 +1185,16 @@ async def api_scan_start(request: Request) -> dict:
     blocked = _guard_unsafe_response()
     if blocked is not None:
         return blocked
-    body = await request.json() if await request.body() else {}
-    plan_id = body.get("plan_id") or None
-    if plan_id is not None and db.query_one("SELECT id FROM scan_plans WHERE id=?", (plan_id,)) is None:
-        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
+    body = await json_body(request, required=False)
+    plan_id = body.get("plan_id")
+    if plan_id in (None, "", 0):
+        plan_id = None
+    if plan_id is not None:
+        if isinstance(plan_id, bool) or not isinstance(plan_id, int):
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "plan_id 必须是整数", "details": {"field": "plan_id"}})
+        _check_path_id(plan_id, "方案")
+        if db.query_one("SELECT id FROM scan_plans WHERE id=?", (plan_id,)) is None:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
     if scan_engine.is_running():
         raise HTTPException(status_code=409, detail={"code": "SCAN_RUNNING", "message": "已有扫描在运行"})
     try:
@@ -641,13 +1234,15 @@ def _run_row(row) -> dict:
 @app.get("/api/v1/scans")
 def api_scans(request: Request, limit: int = 20) -> dict:
     _require_api(request)
-    rows = db.query("SELECT * FROM scan_runs ORDER BY id DESC LIMIT ?", (min(limit, 100),))
+    limit = _clamp_limit(limit, 20, 100)
+    rows = db.query("SELECT * FROM scan_runs ORDER BY id DESC LIMIT ?", (limit,))
     return {"items": [_run_row(r) for r in rows]}
 
 
 @app.get("/api/v1/scans/{run_id}")
 def api_scan_detail(run_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(run_id, "任务")
     row = db.query_one("SELECT * FROM scan_runs WHERE id=?", (run_id,))
     if row is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "任务不存在"})
@@ -665,6 +1260,7 @@ def api_scan_control(run_id: int, action: str, request: Request) -> dict:
     finished_at IS NULL), so a late click can never resurrect a dead run.
     """
     _require_api(request)
+    _check_path_id(run_id, "任务")
     # action -> (new status, allowed current statuses)
     mapping = {
         "pause": ("paused", ("running",)),
@@ -713,11 +1309,24 @@ def api_review_groups(
     status: str | None = None,
     q: str | None = None,
     min_size: int | None = None,
+    dir: str | None = None,
+    ext: str | None = None,
     cursor: int = 0,
     limit: int = 50,
 ) -> dict:
     _require_api(request)
-    data = review.list_groups(db, kind, status, q, min_size, cursor, limit)
+    cursor = _check_query_int(cursor, "cursor")
+    if min_size is not None:
+        min_size = _check_query_int(min_size, "min_size")
+    limit = _clamp_limit(limit, 50, 200)
+    if dir is not None and len(dir) > 1024:
+        raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "dir 过长", "details": {"field": "dir"}})
+    if ext is not None and len(ext) > 64:
+        raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "ext 过长", "details": {"field": "ext"}})
+    data = review.list_groups(
+        db, kind, status, q, min_size, cursor, limit,
+        dir_prefix=dir, ext=ext,
+    )
     data["stats"] = review.stats(db)
     return data
 
@@ -725,6 +1334,7 @@ def api_review_groups(
 @app.get("/api/v1/review/groups/{group_id}")
 def api_review_group(group_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(group_id, "分组")
     data = review.group_detail(db, group_id)
     if data is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "分组不存在"})
@@ -734,9 +1344,28 @@ def api_review_group(group_id: int, request: Request) -> dict:
 @app.put("/api/v1/review/groups/{group_id}")
 async def api_review_save(group_id: int, request: Request) -> dict:
     _require_api(request)
-    body = await request.json()
+    _check_path_id(group_id, "分组")
+    body = await json_body(request, required=True)
+    policy = body.get("policy")
+    if policy is not None:
+        if not isinstance(policy, str) or policy not in KEEP_POLICIES:
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "保留策略不合法", "details": {"field": "policy"}})
+    items = body.get("items") or []
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "items 必须是数组"})
+    decisions: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "items 的每一项必须是对象"})
+        item_id = item.get("item_id")
+        if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id < 0 or item_id > SQLITE_INT_MAX:
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "item_id 不合法", "details": {"field": "item_id"}})
+        decision = item.get("decision")
+        if not isinstance(decision, str):
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "decision 不合法", "details": {"field": "decision"}})
+        decisions.append({"item_id": item_id, "decision": decision})
     try:
-        return review.save_decisions(db, group_id, body.get("policy"), body.get("items") or [])
+        return review.save_decisions(db, group_id, policy, decisions)
     except review.ReviewError as exc:
         return _json_error(exc.code, exc.message, 422 if exc.code == "GROUP_KEEP_VIOLATION" else 400,
                            exc.details)
@@ -745,12 +1374,14 @@ async def api_review_save(group_id: int, request: Request) -> dict:
 @app.post("/api/v1/review/groups/{group_id}/skip")
 def api_review_skip(group_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(group_id, "分组")
     return review.skip_group(db, group_id)
 
 
 @app.post("/api/v1/review/groups/{group_id}/recheck")
 def api_review_recheck(group_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(group_id, "分组")
     return {"items": review.recheck_group(db, group_id)}
 
 
@@ -769,9 +1400,10 @@ async def api_plan_generate(request: Request) -> dict:
     blocked = _guard_unsafe_response()
     if blocked is not None:
         return blocked
-    body = await request.json() if await request.body() else {}
+    body = await json_body(request, required=False)
+    note = _body_str(body, "note", label="备注", maximum=PLAN_NOTE_MAX)
     try:
-        return plans.generate_plan(db, str(body.get("note") or ""))
+        return plans.generate_plan(db, note)
     except plans.PlanError as exc:
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": exc.message})
 
@@ -785,6 +1417,7 @@ def api_plans_list(request: Request) -> dict:
 @app.get("/api/v1/delete-plans/{plan_id}")
 def api_plan_detail(plan_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(plan_id, "方案")
     data = plans.plan_detail(db, plan_id)
     if data is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
@@ -794,6 +1427,7 @@ def api_plan_detail(plan_id: int, request: Request) -> dict:
 @app.post("/api/v1/delete-plans/{plan_id}/recheck")
 def api_plan_recheck(plan_id: int, request: Request) -> dict:
     _require_api(request)
+    _check_path_id(plan_id, "方案")
     data = plans.recheck_plan(db, plan_id)
     if data is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "方案不存在"})
@@ -803,6 +1437,7 @@ def api_plan_recheck(plan_id: int, request: Request) -> dict:
 @app.get("/api/v1/delete-plans/{plan_id}/export")
 def api_plan_export(plan_id: int, request: Request, format: str = "csv"):
     _require_api(request)
+    _check_path_id(plan_id, "方案")
     blocked = _guard_unsafe_response()
     if blocked is not None:
         return blocked
@@ -837,11 +1472,14 @@ def api_notifications(request: Request, unread: int = 0) -> dict:
 @app.post("/api/v1/notifications/read")
 async def api_notifications_read(request: Request) -> dict:
     _require_api(request)
-    body = await request.json() if await request.body() else {}
+    body = await json_body(request, required=False)
+    if "all" in body and not isinstance(body["all"], bool):
+        raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "all 必须是布尔值", "details": {"field": "all"}})
     if body.get("all"):
         db.execute("UPDATE notifications SET read_at=? WHERE read_at IS NULL", (now_iso(),))
     else:
-        for nid in body.get("ids") or []:
+        ids = _body_id_list(body, "ids", "通知编号") or []
+        for nid in ids:
             db.execute("UPDATE notifications SET read_at=? WHERE id=?", (now_iso(), nid))
     db.commit()
     return {"ok": True}
@@ -861,26 +1499,43 @@ def api_settings(request: Request) -> dict:
 @app.put("/api/v1/settings")
 async def api_settings_update(request: Request) -> dict:
     _require_api(request)
-    body = await request.json()
-    for key in ("default_keep_policy", "rate_meta", "rate_hash", "notify_in_app"):
+    body = await json_body(request, required=True)
+    unknown = sorted(set(body) - set(SETTINGS_INT_RANGES) - {"default_keep_policy", "notify_in_app"})
+    if unknown:
+        raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": f"未知设置项: {', '.join(unknown)}", "details": {"fields": unknown}})
+    if "default_keep_policy" in body:
+        policy = body["default_keep_policy"]
+        if policy not in KEEP_POLICIES:
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "保留策略不合法", "details": {"field": "default_keep_policy"}})
+        db.set_setting("default_keep_policy", policy)
+    for key, (low, high) in SETTINGS_INT_RANGES.items():
         if key in body:
             value = body[key]
-            if isinstance(value, bool):
-                value = "1" if value else "0"
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": f"{key} 必须是 {low}..{high} 的整数", "details": {"field": key}})
             db.set_setting(key, str(value))
+    if "notify_in_app" in body:
+        value = body["notify_in_app"]
+        if not isinstance(value, bool):
+            raise HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR", "message": "notify_in_app 必须是布尔值", "details": {"field": "notify_in_app"}})
+        db.set_setting("notify_in_app", "1" if value else "0")
     return {"ok": True}
 
 
 @app.post("/api/v1/settings/password")
 async def api_password_change(request: Request) -> dict:
     _require_api(request)
-    body = await request.json()
+    body = await json_body(request, required=True)
+    old = body.get("old_password", "")
+    if not isinstance(old, str):
+        return _json_error("VALIDATION_ERROR", "旧口令必须是字符串", 400)
     stored = db.get_setting("password_hash", "") or ""
-    if not verify_password(str(body.get("old_password", "")), stored):
+    if not verify_password(old, stored):
         return _json_error("AUTH_INVALID", "旧口令错误", 401)
-    new = str(body.get("new_password", ""))
-    if len(new) < 10:
-        return _json_error("VALIDATION_ERROR", "新口令至少 10 位", 400)
+    new = body.get("new_password", "")
+    error = _valid_password(new)
+    if error:
+        return _json_error("VALIDATION_ERROR", error.replace("口令", "新口令", 1), 400)
     db.set_setting("password_hash", hash_password(new))
     sessions.rotate_secret()
     db.audit("user", "auth.password_change", "")
@@ -1075,14 +1730,27 @@ def scans_page(request: Request):
 
 
 @app.get("/review", response_class=HTMLResponse)
-def review_page(request: Request, kind: str = "content", status: str = "pending", cursor: int = 0):
+def review_page(
+    request: Request,
+    kind: str = "content",
+    status: str = "pending",
+    dir: str = "",
+    ext: str = "",
+    cursor: int = 0,
+):
     redir = _require_page(request)
     if redir:
         return redir
-    data = review.list_groups(db, kind, status or None, None, None, cursor, 50)
+    cursor = 0 if cursor < 0 else min(cursor, SQLITE_INT_MAX)
+    filters = {"dir": dir.strip(), "ext": ext.strip()}
+    data = review.list_groups(
+        db, kind, status or None, None, None, cursor, 50,
+        dir_prefix=filters["dir"] or None, ext=filters["ext"] or None,
+    )
     return _page(
         request, "review.html",
         groups=data["items"], kind=kind, status=status,
+        dir=filters["dir"], ext=filters["ext"],
         next_cursor=data.get("next_cursor"), stats=review.stats(db),
     )
 
@@ -1092,6 +1760,8 @@ def review_detail_page(request: Request, group_id: int):
     redir = _require_page(request)
     if redir:
         return redir
+    if group_id < 0 or group_id > SQLITE_INT_MAX:
+        return RedirectResponse("/review", status_code=303)
     data = review.group_detail(db, group_id)
     if data is None:
         return RedirectResponse("/review", status_code=303)
@@ -1139,6 +1809,8 @@ def delete_plan_detail_page(request: Request, plan_id: int):
     redir = _require_page(request)
     if redir:
         return redir
+    if plan_id < 0 or plan_id > SQLITE_INT_MAX:
+        return RedirectResponse("/delete-plans", status_code=303)
     data = plans.plan_detail(db, plan_id)
     if data is None:
         return RedirectResponse("/delete-plans", status_code=303)
@@ -1158,6 +1830,7 @@ def settings_page(request: Request):
             "rate_hash": db.get_setting("rate_hash", "50"),
         },
         guard=_guard_snapshot(),
+        log_files=_log_files(),
     )
 
 

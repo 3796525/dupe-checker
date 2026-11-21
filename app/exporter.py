@@ -24,6 +24,18 @@ from datetime import datetime
 from .config import config
 from .db import Database
 
+# DEF-10: spreadsheet formula injection. A cell starting with one of these
+# characters is executed as a formula by Excel/LibreOffice when opened; the
+# export is consumed by hand, so prefix such cells with an apostrophe.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value):
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 NOTICE = (
     "本工具不会执行删除。请按下列路径在 NAS 上手工核对并删除；"
     "删除前请核对大小与 SHA-256，出现 changed/missing 的条目请先重新扫描。"
@@ -105,8 +117,9 @@ def build_export(db: Database, plan_id: int, fmt: str) -> tuple[str, str, bytes]
         )
         for i in plan["items"]:
             w.writerow(
-                [i["path"], i["size"], _iso(i["mtime_ns"]), i["sha256"],
-                 i["keep_path"], i["recheck_status"], status, i["kind"]]
+                [_csv_cell(value) for value in
+                 [i["path"], i["size"], _iso(i["mtime_ns"]), i["sha256"],
+                  i["keep_path"], i["recheck_status"], status, i["kind"]]]
             )
         # A leading comment line carries the safety notice; BOM keeps Excel happy
         # with UTF-8 paths. Tools reading the CSV should skip lines starting with '#'.

@@ -56,9 +56,16 @@
   <dl class="kv">
     <div><dt>大小</dt><dd>{{ m.size | bytes }}</dd></div>
     <div><dt>修改时间</dt><dd>{{ m.mtime_ns | ts }}</dd></div>
+    <div><dt>所属目录</dt><dd class="mono small">{{ m.dir }}</dd></div>
+    <div><dt>硬链接数</dt><dd>{{ m.nlink if m.nlink is not none else '未知' }}</dd></div>
     <div><dt>内容哈希</dt><dd class="mono small">{{ (m.sha256[:16] + '…') if m.sha256 else '尚未计算' }}</dd></div>
     <div><dt>状态</dt><dd>{% if m.state == 'missing' %}<span class="warn">文件已不存在</span>{% elif m.state == 'changed' %}<span class="warn">文件已被修改</span>{% elif not m.readable %}<span class="warn">当前不可读</span>{% else %}可读取{% endif %}</dd></div>
   </dl>
+  {% if m.nlink and m.nlink > 1 %}
+  <div class="notice warn small" style="margin:8px 0">
+    硬链接（与其它路径共用同一份数据，删除本路径通常不释放空间）。
+  </div>
+  {% endif %}
   <div class="choice">
     <label class="on-keep">
       <input type="radio" name="dec_{{ m.id }}" value="keep" data-item="{{ m.id }}" {{ 'checked' if m.decision == 'keep' or (m.decision == 'undecided' and m.id == group.suggested_keep) }}>

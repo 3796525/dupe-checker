@@ -219,9 +219,9 @@ def test_setup_then_csrf_is_enforced(client):
         json={"name": "夜间扫描", "root_ids": [1], "trigger_type": "manual"},
         headers={CSRF_HEADER: csrf},
     )
-    # root id 1 does not exist here, but validation happens after roots lookup: either 200 or 400 is fine,
+    # root id 1 does not exist here, but validation happens after roots lookup: either 201 or 400 is fine,
     # what matters is that CSRF is accepted and the request reaches the handler.
-    assert ok.status_code in (200, 400)
+    assert ok.status_code in (201, 400)
     assert ok.status_code != 403
 
 
@@ -271,6 +271,10 @@ def test_guard_unsafe_blocks_protected_routes(client, db):
         assert export.status_code == 409
         assert "只读自检" in export.json()["error"]["message"]
 
+        globs = client.post("/api/v1/plans/1/test-globs", json={}, headers=headers)
+        assert globs.status_code == 409
+        assert globs.json()["error"]["code"] == "GUARD_UNSAFE"
+
         assert client.get("/health").json()["status"] == "fatal"
         assert client.get("/api/v1/system/guard").status_code == 200
     finally:
@@ -309,7 +313,7 @@ def test_full_read_only_workflow(client, web, db, root):
               "rate_meta": 100000, "rate_hash": 10000},
         headers=headers,
     )
-    assert plan.status_code == 200, plan.text
+    assert plan.status_code == 201, plan.text
     plan_id = plan.json()["id"]
 
     started = client.post("/api/v1/scans", json={"plan_id": plan_id}, headers=headers)
@@ -657,4 +661,498 @@ def test_roots_and_plans_pages_use_compact_layout(client, db, root):
     assert 'class="picker-item"' in plans_html
     assert 'id="root-count"' in plans_html
     assert "全选" in plans_html and "全不选" in plans_html
+
+# ---------------------------------------------------------------------------
+# QA DEF-01..DEF-07 / DEF-11 / DEF-12 regression: release hardening
+# ---------------------------------------------------------------------------
+INT_MAX = 2**63 - 1
+HUGE_ID = 10**30
+
+
+def _raw_headers(csrf: str | None = None) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if csrf:
+        headers[CSRF_HEADER] = csrf
+    return headers
+
+
+@pytest.mark.parametrize("raw", ["not-json", "[]", '"text"', "null", "1", "true"])
+def test_malformed_login_body_is_a_client_error(client, raw):
+    """DEF-01: malformed JSON bodies used to escape as HTTP 500."""
+    resp = client.post("/api/v1/auth/login", content=raw, headers=_raw_headers())
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_login_empty_and_wrongly_typed_password_are_client_errors(client):
+    empty = client.post("/api/v1/auth/login", content="", headers=_raw_headers())
+    assert empty.status_code == 400
+    assert empty.json()["error"]["code"] == "VALIDATION_ERROR"
+    odd = client.post("/api/v1/auth/login", json={"password": []})
+    assert odd.status_code == 400
+    assert odd.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert client.get("/api/v1/plans").status_code == 401
+
+
+def test_setup_malformed_body_is_a_client_error(client, db):
+    resp = client.post("/api/v1/auth/setup", content="{broken", headers=_raw_headers())
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert db.get_setting("password_hash") is None
+
+
+@pytest.mark.parametrize("raw", ["{broken", "[]", '"text"', "null"])
+def test_malformed_authenticated_bodies_are_client_errors(client, raw):
+    """DEF-01/DEF-02: plan create, review save, settings and password change."""
+    csrf = login(client)
+    headers = _raw_headers(csrf)
+    plan = client.post("/api/v1/plans", content=raw, headers=headers)
+    assert plan.status_code == 400, plan.text
+    assert plan.json()["error"]["code"] == "VALIDATION_ERROR"
+    settings = client.put("/api/v1/settings", content=raw, headers=headers)
+    assert settings.status_code == 400, settings.text
+    assert settings.json()["error"]["code"] == "VALIDATION_ERROR"
+    password = client.post("/api/v1/settings/password", content=raw, headers=headers)
+    assert password.status_code == 400, password.text
+    assert password.json()["error"]["code"] == "VALIDATION_ERROR"
+    group = client.put("/api/v1/review/groups/1", content=raw, headers=headers)
+    assert group.status_code == 400, group.text
+    assert group.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_plan_body_fields_are_validated(client, db, root):
+    csrf = login(client)
+    headers = _raw_headers(csrf)
+    root_id = add_root(db, root)
+    long_name = client.post("/api/v1/plans", json={"name": "x" * 201, "root_ids": [root_id]}, headers=headers)
+    assert long_name.status_code == 422
+    assert long_name.json()["error"]["code"] == "VALIDATION_ERROR"
+    non_list = client.post("/api/v1/plans", json={"name": "p", "root_ids": "1"}, headers=headers)
+    assert non_list.status_code == 422
+    bad_id = client.post("/api/v1/plans", json={"name": "p", "root_ids": [HUGE_ID]}, headers=headers)
+    assert bad_id.status_code == 422
+    bad_rate = client.post(
+        "/api/v1/plans", json={"name": "p", "root_ids": [root_id], "rate_meta": "fast"}, headers=headers
+    )
+    assert bad_rate.status_code == 422
+    assert not db.query("SELECT id FROM scan_plans")
+
+
+def test_body_larger_than_one_mib_is_rejected(client):
+    """DEF-04: the 1 MiB request body cap is enforced before JSON parsing."""
+    csrf = login(client)
+    resp = client.post(
+        "/api/v1/plans", content=b"x" * (1024 * 1024 + 1), headers=_raw_headers(csrf)
+    )
+    assert resp.status_code == 413
+    assert resp.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+
+
+def test_scan_start_rejects_wrongly_typed_plan_id(client):
+    csrf = login(client)
+    resp = client.post("/api/v1/scans", json={"plan_id": "1"}, headers=_raw_headers(csrf))
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_notifications_read_validates_body(client):
+    csrf = login(client)
+    headers = _raw_headers(csrf)
+    malformed = client.post("/api/v1/notifications/read", content="not-json", headers=headers)
+    assert malformed.status_code == 400
+    bad = client.post("/api/v1/notifications/read", json={"all": "yes"}, headers=headers)
+    assert bad.status_code == 422
+    assert bad.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("bad", [
+    {"rate_meta": "abc"},
+    {"rate_meta": -5},
+    {"rate_meta": 99999},
+    {"rate_meta": True},
+    {"rate_hash": 0},
+    {"rate_hash": 1001},
+    {"default_keep_policy": "bogus"},
+    {"notify_in_app": "yes"},
+    {"unknown_key": 1},
+])
+def test_settings_reject_out_of_contract_values(client, db, bad):
+    """DEF-05: settings are whitelisted, range checked and never silently stored."""
+    csrf = login(client)
+    before = {key: db.get_setting(key) for key in bad}
+    resp = client.put("/api/v1/settings", json=bad, headers=_raw_headers(csrf))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert {key: db.get_setting(key) for key in bad} == before
+
+
+def test_settings_valid_update_persists(client, db):
+    csrf = login(client)
+    resp = client.put(
+        "/api/v1/settings",
+        json={"default_keep_policy": "longest_path", "rate_meta": 500,
+              "rate_hash": 100, "notify_in_app": True},
+        headers=_raw_headers(csrf),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+    assert db.get_setting("default_keep_policy") == "longest_path"
+    assert db.get_setting("rate_meta") == "500"
+    assert db.get_setting("rate_hash") == "100"
+    assert db.get_setting("notify_in_app") == "1"
+
+
+def test_password_change_rejects_short_new_password(client):
+    csrf = login(client)
+    resp = client.post(
+        "/api/v1/settings/password",
+        json={"old_password": PASSWORD, "new_password": "short"},
+        headers=_raw_headers(csrf),
+    )
+    assert resp.status_code == 400
+    assert "新口令" in resp.json()["error"]["message"]
+
+
+def test_review_save_rejects_bad_policy_and_item_fields(client, db, root):
+    csrf = _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    headers = _raw_headers(csrf)
+    keep_id = client.get(f"/api/v1/review/groups/{group['id']}").json()["items"][0]["id"]
+    bad_policy = client.put(f"/api/v1/review/groups/{group['id']}", json={"policy": "bogus"}, headers=headers)
+    assert bad_policy.status_code == 422
+    huge_item = client.put(
+        f"/api/v1/review/groups/{group['id']}",
+        json={"items": [{"item_id": HUGE_ID, "decision": "keep"}]},
+        headers=headers,
+    )
+    assert huge_item.status_code == 422
+    bad_decision = client.put(
+        f"/api/v1/review/groups/{group['id']}",
+        json={"items": [{"item_id": keep_id, "decision": 1}]},
+        headers=headers,
+    )
+    assert bad_decision.status_code == 422
+    bad_items = client.put(f"/api/v1/review/groups/{group['id']}", json={"items": "nope"}, headers=headers)
+    assert bad_items.status_code == 400
+
+
+def test_delete_plan_note_length_is_capped(client, db, root):
+    csrf = _prepared_scan(client, db, root)
+    resp = client.post("/api/v1/delete-plans", json={"note": "n" * 2001}, headers=_raw_headers(csrf))
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_plan_update_validates_body(client, db, root):
+    csrf = login(client)
+    headers = _raw_headers(csrf)
+    root_id = add_root(db, root)
+    made = client.post("/api/v1/plans", json={"name": "patch-me", "root_ids": [root_id]}, headers=headers)
+    assert made.status_code == 201, made.text
+    plan_id = made.json()["id"]
+    malformed = client.patch(f"/api/v1/plans/{plan_id}", content="not-json", headers=headers)
+    assert malformed.status_code == 400
+    bad_trigger = client.patch(f"/api/v1/plans/{plan_id}", json={"trigger_type": "minutely"}, headers=headers)
+    assert bad_trigger.status_code == 400
+    long_name = client.patch(f"/api/v1/plans/{plan_id}", json={"name": "n" * 201}, headers=headers)
+    assert long_name.status_code == 422
+    ok = client.patch(f"/api/v1/plans/{plan_id}", json={"enabled": True}, headers=headers)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["enabled"] is True
+
+
+@pytest.mark.parametrize("method,path", [
+    ("get", "/api/v1/review/groups/{id}"),
+    ("get", "/api/v1/scans/{id}"),
+    ("post", "/api/v1/scans/{id}/pause"),
+    ("get", "/api/v1/delete-plans/{id}"),
+    ("post", "/api/v1/delete-plans/{id}/recheck"),
+    ("get", "/api/v1/delete-plans/{id}/export"),
+    ("patch", "/api/v1/plans/{id}"),
+    ("delete", "/api/v1/plans/{id}"),
+])
+@pytest.mark.parametrize("bad_id", [HUGE_ID, -1])
+def test_out_of_range_path_ids_are_not_500(client, method, path, bad_id):
+    """DEF-03: sqlite3 cannot bind ids outside signed 64 bit; never 500."""
+    csrf = login(client)
+    kwargs = {"headers": _raw_headers(csrf)}
+    if method in ("post", "patch"):
+        kwargs["json"] = {}
+    resp = client.request(method, path.format(id=bad_id), **kwargs)
+    assert resp.status_code in (404, 422), (method, path, resp.status_code, resp.text)
+    assert resp.json()["error"]["code"] in ("NOT_FOUND", "VALIDATION_ERROR")
+
+
+@pytest.mark.parametrize("params", [
+    {"cursor": HUGE_ID}, {"cursor": -1}, {"min_size": HUGE_ID}, {"min_size": -5},
+])
+def test_review_groups_rejects_out_of_range_query_ints(client, params):
+    login(client)
+    resp = client.get("/api/v1/review/groups", params=params)
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_tree_endpoint_rejects_out_of_range_root_id(client):
+    login(client)
+    resp = client.get("/api/v1/roots/tree", params={"root_id": HUGE_ID})
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_scans_limit_is_clamped(client, db):
+    """DEF-11: limit below 1 used to mean 'no limit' in SQLite."""
+    login(client)
+    for _ in range(3):
+        _insert_run(db, "completed", now_iso())
+
+    def items(params):
+        return client.get("/api/v1/scans", params=params).json()["items"]
+
+    assert len(items({"limit": -3})) == 1
+    assert len(items({"limit": 0})) == 1
+    assert len(items({"limit": 999})) == 3
+
+
+def test_security_headers_are_added_to_every_response(client):
+    """DEF-06: CSP / nosniff / frame denial / referrer policy."""
+    login(client)
+    for path in ("/health", "/api/v1/system/version", "/", "/settings"):
+        resp = client.get(path)
+        assert resp.status_code == 200, path
+        csp = resp.headers["content-security-policy"]
+        assert "default-src 'self'" in csp
+        assert "img-src 'self' data:" in csp
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["referrer-policy"] == "no-referrer"
+    err = client.get("/api/v1/review/groups/999999")
+    assert err.status_code == 404
+    assert err.headers["x-content-type-options"] == "nosniff"
+
+
+def test_health_is_minimal_and_path_free(client, db):
+    """DEF-07: anonymous health must not leak filesystem paths."""
+    csrf = login(client)
+    assert csrf
+    report = GuardReport(
+        verified_at=now_iso(),
+        roots=[RootCheck(path="/secret/path/do-not-leak", exists=True, is_dir=True,
+                         readable=True, readonly=False, error="目录可写")],
+    )
+    guard_mod.apply_report(report, db)
+    try:
+        health = client.get("/health")
+        assert health.status_code == 200
+        body = health.json()
+        assert body["status"] == "fatal"
+        assert body["guard_passed"] is False
+        assert body["version"] == config.version
+        assert "guard" not in body
+        assert "/secret" not in health.text
+
+        system = client.get("/api/v1/system/health")
+        assert system.status_code == 200
+        assert "/secret" not in system.text
+        assert system.json()["guard"] == {
+            "passed": False, "unsafe": True, "roots_total": 1, "roots_passed": 0,
+        }
+
+        # the authenticated report still carries full detail for the operator
+        full = client.get("/api/v1/system/guard")
+        assert full.status_code == 200
+        assert "/secret/path/do-not-leak" in full.text
+    finally:
+        guard_mod.reset_state()
+
+
+def test_dead_path_validator_is_removed(web):
+    """DEF-12: _validate_path/_root_paths were unreachable dead code."""
+    assert not hasattr(web, "_validate_path")
+    assert not hasattr(web, "_root_paths")
+    with open(web.__file__, encoding="utf-8") as fh:
+        source = fh.read()
+    assert "_validate_path" not in source
+    assert "_root_paths" not in source
+
+
+
+# ---------------------------------------------------------------------------
+# QA functional defects: DEF-02 / DEF-05 / DEF-06 / DEF-07 / DEF-09
+# ---------------------------------------------------------------------------
+def test_plan_test_globs_preview_is_read_only_and_csrf_guarded(client, db, root):
+    """DEF-02: read-only glob preview, no plan/index mutation, CSRF required."""
+    csrf = _prepared_scan(client, db, root)
+    root_id = db.query_one("SELECT id FROM scan_roots")["id"]
+    plan = client.post(
+        "/api/v1/plans",
+        json={"name": "preview-me", "root_ids": [root_id]},
+        headers=_raw_headers(csrf),
+    )
+    assert plan.status_code == 201, plan.text
+    plan_id = plan.json()["id"]
+    plans_before = [row["id"] for row in db.query("SELECT id FROM scan_plans ORDER BY id")]
+    files_before = db.query_one("SELECT COUNT(*) AS n FROM files")["n"]
+
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/test-globs",
+        json={"include_globs": "*", "exclude_globs": "*.tmp"},
+        headers=_raw_headers(csrf),
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["plan_id"] == plan_id
+    assert data["include_globs"] == ["*"]
+    assert data["excluded"] == 0
+    assert data["included"] == 5  # a/dup.txt, b/dup_copy.txt, c/unique.txt, 2x same_name.txt
+    assert data["total"] == 8  # + the three directories
+    paths = {item["path"] for item in data["matched"]}
+    assert str(root / "a" / "dup.txt") in paths
+
+    # nothing was written: same plans, same file index, root untouched
+    assert [row["id"] for row in db.query("SELECT id FROM scan_plans ORDER BY id")] == plans_before
+    assert db.query_one("SELECT COUNT(*) AS n FROM files")["n"] == files_before
+    assert not list(root.rglob(".dupe_write_probe_*"))
+
+    # CSRF is enforced on this POST, and an unknown plan is a 404
+    assert client.post(f"/api/v1/plans/{plan_id}/test-globs", json={}).status_code == 403
+    missing = client.post(
+        "/api/v1/plans/999999/test-globs", json={}, headers=_raw_headers(csrf)
+    )
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_plan_response_exposes_globs_array_view(client, db, root):
+    """DEF-09: GET /plans keeps the string fields and adds parsed arrays."""
+    csrf = _prepared_scan(client, db, root)
+    root_id = db.query_one("SELECT id FROM scan_roots")["id"]
+    created = client.post(
+        "/api/v1/plans",
+        json={
+            "name": "globs",
+            "root_ids": [root_id],
+            "include_globs": "*.jpg,*.png",
+            "exclude_globs": "@eaDir/**",
+        },
+        headers=_raw_headers(csrf),
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["include_globs"] == "*.jpg,*.png"
+    assert body["globs"] == {"include": ["*.jpg", "*.png"], "exclude": ["@eaDir/**"]}
+
+    listed = client.get("/api/v1/plans").json()["items"]
+    assert listed[0]["globs"]["include"] == ["*.jpg", "*.png"]
+
+
+def test_tree_endpoint_has_path_and_has_children(client, db, root):
+    """DEF-09: one-level tree entries carry path and a drill-down hint."""
+    csrf = _prepared_scan(client, db, root)
+    root_id = db.query_one("SELECT id FROM scan_roots")["id"]
+    data = client.get(
+        "/api/v1/roots/tree", params={"root_id": root_id}, headers=_raw_headers(csrf)
+    ).json()
+    by_name = {item["name"]: item for item in data["items"]}
+    assert set(by_name) == {"a", "b", "c"}
+    for name in ("a", "b", "c"):
+        entry = by_name[name]
+        assert entry["is_dir"] is True
+        assert entry["has_children"] is True
+        assert entry["path"] == str(root / name)
+
+
+def test_review_detail_page_warns_about_hardlinks(client, db, root):
+    """DEF-05: nlink > 1 is shown with the frees-no-space warning."""
+    _prepared_scan(client, db, root)
+    group = _groups(client)[0]
+    detail = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    target = detail["items"][0]["path"]
+    os.link(target, os.path.join(os.path.dirname(target), "hardlink-copy.txt"))
+
+    refreshed = client.get(f"/api/v1/review/groups/{group['id']}").json()
+    linked = next(item for item in refreshed["items"] if item["path"] == target)
+    assert linked["nlink"] == 2, "hard link count must be exposed"
+    for item in refreshed["items"]:
+        assert item["dir"] == os.path.dirname(item["path"])
+
+    page = client.get(f"/review/{group['id']}")
+    assert page.status_code == 200
+    assert "硬链接" in page.text
+    assert "所属目录" in page.text
+    assert "不会释放空间" in page.text or "不释放空间" in page.text
+
+
+def test_logs_listing_tail_and_download(client, monkeypatch, tmp_path):
+    """DEF-06: whitelisted log files can be listed, tailed and downloaded."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "app.log").write_text("first line\nsecond line\n", encoding="utf-8")
+    (log_dir / "unrelated.txt").write_text("must not be listed", encoding="utf-8")
+    monkeypatch.setattr(config, "log_dir", log_dir)
+    login(client)
+
+    resp = client.get("/api/v1/system/logs", params={"limit": 200})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["name"] == "app.log"
+    assert data["lines"][-2:] == ["first line", "second line"]
+    assert [item["name"] for item in data["files"]] == ["app.log"]
+
+    download = client.get("/api/v1/system/logs/download", params={"name": "app.log"})
+    assert download.status_code == 200
+    assert download.text == "first line\nsecond line\n"
+    assert "attachment" in download.headers["content-disposition"]
+
+    settings_page = client.get("/settings")
+    assert settings_page.status_code == 200
+    assert "运行日志" in settings_page.text
+    assert "app.log" in settings_page.text
+
+
+@pytest.mark.parametrize("name", ["../config.py", "/etc/passwd", "app.log/../config.py", "unrelated.txt", ""])
+def test_logs_reject_non_whitelisted_names(client, monkeypatch, tmp_path, name):
+    """DEF-06: only exact whitelisted names; traversal can never resolve."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "app.log").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "config.py").write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(config, "log_dir", log_dir)
+    login(client)
+
+    assert client.get("/api/v1/system/logs", params={"name": name}).status_code == 404
+    assert client.get("/api/v1/system/logs/download", params={"name": name}).status_code == 404
+    # a missing rotation backup is a plain 404 too
+    assert client.get(
+        "/api/v1/system/logs", params={"name": "app.log.2026-01-01"}
+    ).status_code == 404
+
+
+def test_review_groups_filter_by_dir_and_ext(client, db, root):
+    """DEF-07: directory-prefix and extension filters narrow the review list."""
+    _prepared_scan(client, db, root)
+
+    def ids(params):
+        resp = client.get("/api/v1/review/groups", params={"kind": "content", "status": "", **params})
+        assert resp.status_code == 200, resp.text
+        return [item["id"] for item in resp.json()["items"]]
+
+    all_ids = ids({})
+    assert all_ids, "expected a content group from the scan"
+    assert ids({"dir": "a"}) == all_ids
+    assert ids({"dir": "b"}) == all_ids  # b/dup_copy.txt is the other member
+    assert ids({"dir": "no-such-dir"}) == []
+    assert ids({"ext": ".txt"}) == all_ids
+    assert ids({"ext": "txt"}) == all_ids  # a leading dot is optional
+    assert ids({"ext": ".TXT"}) == all_ids  # case insensitive
+    assert ids({"ext": ".png"}) == []
+    # escaping: % and _ are literal, not wildcards
+    assert ids({"dir": "%"}) == []
+
+    page = client.get("/review", params={"kind": "content", "status": "", "dir": "a", "ext": ".txt"})
+    assert page.status_code == 200
+    assert "所属目录" in page.text
+    filtered = client.get("/review", params={"kind": "content", "status": "", "dir": "no-such-dir"})
+    assert filtered.status_code == 200
+    assert "没有符合条件的重复组" in filtered.text
 

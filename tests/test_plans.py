@@ -201,3 +201,48 @@ def test_recheck_plan_detects_changed_content(db, root):
 
 def test_recheck_plan_missing_plan_returns_none(db):
     assert plans.recheck_plan(db, 999) is None
+
+# ---------------------------------------------------------------------------
+# DEF-10: CSV formula injection (QA adversarial finding)
+# ---------------------------------------------------------------------------
+def _csv_rows_raw(db, plan_id):
+    """Parse the CSV with embedded CR/LF preserved (newline='' semantics)."""
+    _, _, payload = exporter.build_export(db, plan_id, "csv")
+    text = payload.decode("utf-8-sig")
+    rest = text.partition("\r\n")[2]
+    return list(csv.DictReader(io.StringIO(rest, newline="")))
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
+def test_csv_export_neutralises_formula_paths(db, root, prefix):
+    plan_id, delete_path, keep_path = _approved_plan(db, root)
+    hostile = prefix + "cmd|' /C calc'!A0"
+    db.execute(
+        "UPDATE plan_items SET path=? WHERE plan_id=? AND path=?",
+        (hostile, plan_id, delete_path),
+    )
+    db.commit()
+    rows = _csv_rows_raw(db, plan_id)
+    assert rows[0]["path"] == "'" + hostile
+    # a real keep path is not a formula and stays byte-identical
+    assert rows[0]["keep_path"] == keep_path
+
+
+def test_csv_export_leaves_ordinary_paths_alone(db, root):
+    plan_id, delete_path, _ = _approved_plan(db, root)
+    rows = _csv_rows_raw(db, plan_id)
+    assert rows[0]["path"] == delete_path
+    assert not rows[0]["path"].startswith("'")
+
+
+def test_formula_hardening_does_not_change_json_export(db, root):
+    plan_id, delete_path, _ = _approved_plan(db, root)
+    hostile = "=SUM(A1:A9)"
+    db.execute(
+        "UPDATE plan_items SET path=? WHERE plan_id=? AND path=?",
+        (hostile, plan_id, delete_path),
+    )
+    db.commit()
+    _, _, payload = exporter.build_export(db, plan_id, "json")
+    assert json.loads(payload)["items"][0]["path"] == hostile
+

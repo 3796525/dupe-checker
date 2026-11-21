@@ -78,6 +78,7 @@
         <label>扫描窗口开始 <input name="win_start" placeholder="不限制"></label>
         <label>扫描窗口结束 <input name="win_end" placeholder="不限制"></label>
         <label>排除规则（逗号分隔） <input name="exclude_globs" placeholder="@eaDir/**,#recycle/**,*.tmp"></label>
+        <p class="muted small full">创建方案后，可在方案卡片上点「预览规则匹配结果」先看看规则会命中哪些文件——预览只读，不会扫描建索引、也不会改动任何文件。</p>
         <label>元数据速率（文件/秒） <input name="rate_meta" type="number" value="2000" min="100"></label>
         <label>哈希速率（MB/秒） <input name="rate_hash" type="number" value="50" min="1"></label>
       </div>
@@ -103,13 +104,18 @@
       <p class="muted small">
         扫描时机：{{ p.trigger_text }} · 扫描目录：{{ p.roots_text }} · 速率：{{ p.rate_hash }} MB/s
       </p>
+      {% if p.exclude_globs %}
+      <p class="muted small">排除规则：<span class="mono">{{ p.exclude_globs }}</span></p>
+      {% endif %}
     </div>
     <div class="row" style="margin:0;flex-wrap:nowrap">
       <button class="primary" onclick="runScan({{ p.id }})">立即扫描</button>
+      <button onclick="previewPlan({{ p.id }})">预览规则匹配结果</button>
       <button onclick="togglePlan({{ p.id }}, {{ 'false' if p.enabled else 'true' }})">{{ '停用定时' if p.enabled else '启用定时' }}</button>
       <button class="danger" onclick="deletePlan({{ p.id }})">删除方案</button>
     </div>
   </div>
+  <pre class="preview-result muted small mono" id="preview-{{ p.id }}" hidden></pre>
 </div>
 {% else %}
 <div class="card empty">
@@ -176,6 +182,25 @@ document.getElementById('plan-form').addEventListener('submit', async (e) => {
   const r = await api('POST', '/api/v1/plans', body);
   if (r.ok) location.href = '/plans'; else err.textContent = (r.data.error || {}).message || '创建失败';
 });
+async function previewPlan(id) {
+  const box = document.getElementById('preview-' + id);
+  box.hidden = false;
+  box.textContent = '正在预览（只读，不会修改任何文件）…';
+  const r = await api('POST', '/api/v1/plans/' + id + '/test-globs', {});
+  if (!r.ok) { box.textContent = (r.data.error || {}).message || '预览失败'; return; }
+  const d = r.data;
+  const files = (d.matched || []).filter(x => !x.is_dir).map(x => x.path);
+  let text = '规则命中 ' + d.total + ' 项（其中文件 ' + d.included + ' 个）';
+  if (d.excluded) text += ' · 被排除 ' + d.excluded + ' 项';
+  if (d.truncated) text += ' · 结果已截断';
+  if (!files.length) {
+    text += '\n没有文件命中当前规则，请检查包含/排除规则是否写对。';
+  } else {
+    text += '\n' + files.slice(0, 10).join('\n');
+    if (files.length > 10) text += '\n… 其余 ' + (files.length - 10) + ' 项未显示';
+  }
+  box.textContent = text;
+}
 async function runScan(id) {
   const r = await api('POST', '/api/v1/scans', {plan_id: id});
   if (r.ok) location.href = '/scans'; else alert((r.data.error || {}).message || '启动失败');

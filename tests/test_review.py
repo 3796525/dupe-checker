@@ -238,3 +238,56 @@ def test_list_groups_flags_missing_files(db, root):
         os.unlink(item["path"])
     item = next(i for i in review.list_groups(db, kind="content")["items"] if i["id"] == g["id"])
     assert item["sample_missing"] is True
+
+# ---------------------------------------------------------------------------
+# DEF-05: hard links and owning directory in group details
+# ---------------------------------------------------------------------------
+def test_group_detail_items_include_dir_and_nlink(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    group = _content_group(db)
+    detail = review.group_detail(db, group["id"])
+    assert detail["items"]
+    for item in detail["items"]:
+        assert item["dir"] == os.path.dirname(item["path"])
+        assert item["nlink"] == 1
+
+    # A second hard link means deleting this path alone frees no space, which
+    # the detail payload must expose to the UI.
+    target = detail["items"][0]["path"]
+    os.link(target, os.path.join(os.path.dirname(target), "hardlink-copy.txt"))
+    refreshed = review.group_detail(db, group["id"])
+    linked = next(item for item in refreshed["items"] if item["path"] == target)
+    assert linked["nlink"] == 2
+
+
+def test_group_detail_missing_file_reports_no_nlink(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    group = _content_group(db)
+    detail = review.group_detail(db, group["id"])
+    os.unlink(detail["items"][0]["path"])
+    refreshed = review.group_detail(db, group["id"])
+    missing = next(item for item in refreshed["items"] if item["path"] == detail["items"][0]["path"])
+    assert missing["nlink"] is None
+
+
+# ---------------------------------------------------------------------------
+# DEF-07: directory / extension filters on the review list
+# ---------------------------------------------------------------------------
+def test_list_groups_filters_by_dir_and_ext(db, root):
+    add_root(db, root)
+    build_tree(root)
+    run_scan(db)
+    assert review.list_groups(db, kind="content", dir_prefix="a")["items"]
+    assert review.list_groups(db, kind="content", dir_prefix="b")["items"]
+    assert review.list_groups(db, kind="content", dir_prefix="zzz")["items"] == []
+    assert review.list_groups(db, kind="content", ext=".txt")["items"]
+    assert review.list_groups(db, kind="content", ext="TXT")["items"]
+    assert review.list_groups(db, kind="content", ext=".png")["items"] == []
+    # LIKE wildcards are escaped: a literal % or _ must not match everything
+    assert review.list_groups(db, kind="content", dir_prefix="%")["items"] == []
+    assert review.list_groups(db, kind="content", ext="_")["items"] == []
+
