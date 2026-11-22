@@ -1,6 +1,6 @@
 # 部署与运维指南（DEPLOYMENT）
 
-> 适用范围：本仓库当前开发版（版本 0.1.7）。部署形态为单机 Docker Compose + 只读挂载 NAS 目录。
+> 适用范围：本仓库当前版本 0.1.8（测试阶段修复版）。部署形态为单机 Docker Compose + 只读挂载 NAS 目录。
 >
 > 安全边界请先阅读 [SECURITY-NOTES.md](SECURITY-NOTES.md)（精简版）或 [SECURITY.md](../SECURITY.md)（完整版）；常见问题见 [FAQ.md](FAQ.md)。
 
@@ -334,5 +334,52 @@ rm -rf ./data
 - 单用户、单实例部署；不支持多租户或集群；
 - 不做定时备份，备份需自行安排；
 - 没有在线口令重置；忘记口令只能恢复备份或重建 `./data`；
-- 审核列表按目录/扩展名筛选、目录树逐层下钻、`test-globs` 规则预览等为**计划中**，尚未实现；
+- 审核列表已支持按「所属目录 / 扩展名」筛选，扫描方案已支持 `test-globs` 只读规则预览；
+- 目录树接口一次返回单层，逐层下钻（按需展开子目录）仍为计划项；
 - 升级不保证可降级，回退需恢复旧版本对应的 `./data` 备份。
+
+---
+
+## 15. 飞牛 fnOS 实机部署要点
+
+在飞牛 fnOS（1.2.x，x86_64，底层 Debian 12）上部署时，注意以下与通用 Linux 不同的地方。
+
+**1) docker 命令需要 sudo。** fnOS 默认不给普通用户 docker 组权限，`admin` 直接执行 `docker` 会报
+`permission denied while trying to connect to the Docker daemon socket`。所有部署命令加 `sudo`。
+
+**2) 运行身份用受限账号的 UID/GID，而不是 root。** 推荐在 fnOS 里建一个只被授权了「只读」共享文件夹的账号
+（例如 `dsh-test`，UID/GID 常见为 `1001:1001`），容器以 `APP_UID`/`APP_GID` 等于该账号运行。
+用 `id <账号>` 确认真实 UID/GID，别按名字猜。
+
+**3) 按授权子目录逐个只读挂载，不要挂父目录。** 受限账号通常看不到共享文件夹的父目录（`ls` 父目录会失败），
+因此容器必须把账号有权访问的每个目录逐个挂载到**宿主机原路径**：
+
+    volumes:
+      - "/vol1/1000/其他:/vol1/1000/其他:ro"
+      - "/vol1/1000/我的图库:/vol1/1000/我的图库:ro"
+      - "/vol1/1000/我的游戏:/vol1/1000/我的游戏:ro"
+
+    environment:
+      MOUNT_ROOTS: /vol1/1000/其他,/vol1/1000/我的图库,/vol1/1000/我的游戏
+
+挂父目录会因权限不足导致启动自检失败；多挂一个账号读不了的目录同样会失败（这是 fail-closed 的安全设计）。
+
+**4) 应用数据放扫描根之外。** `./data`（SQLite 索引/导出/日志）建议放在独立目录（如 `/vol1/dupe-checker-app/data`），
+否则它会被自己的扫描索引进去，徒增噪声。若无法避免，在扫描方案的排除规则里加上 `dupe-checker*`。
+
+**5) 端口避开飞牛自身的 5666/5667。** 常见占用：`8080` 可能已被其它应用占用，先用
+`ss -ltnp | grep 8080` 检查，必要时改 `HOST_PORT`。
+
+**6) 桌面快捷入口。** 可以在 fnOS 桌面用「网页」快捷方式指向 `http://<NAS_IP>:<HOST_PORT>/`；
+若后续封装为 `.fpk`（fnpack）应用，入口页面（`desktop_uidir` 的 iframe 或向导跳转）也指向同一地址，
+并在 `privilege` 中保持 `run-as=package`，不要以 root 运行。
+
+**7) 只读挂载的验证方式。** 启动日志里每个根都应出现：
+
+    guard root=/vol1/1000/其他 exists=True readable=True readonly=True nested=20
+
+`readonly=True` 才代表写探测被拒绝；`nested` 是抽样检查过的子目录数（如果任一层子目录可写，工具会拒绝启动）。
+
+**8) 想扩大扫描范围时**，先在 fnOS 控制面板给该受限账号授予对应共享文件夹的**只读**权限，
+再在 `.env` 的 `MOUNT_ROOTS` 与 compose 的 `volumes` 里同步增加一条 `:ro` 挂载，然后
+`sudo docker compose up -d --force-recreate`。
